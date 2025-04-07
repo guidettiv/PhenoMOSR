@@ -33,7 +33,7 @@ config={
     'complexity':['cstd','cmod'],
     'pheno_freq':["[0,0,0]","[2,0,0]","[0,2,0]","[0,0,2]","[2,2,2]"],
     'genetic_mutations':[False,True],
-    'feature_probability':[False,True],
+    'feature_probability':[False],
     'seed':[2804,8356,16130,24305,24399],
     'n_jobs':[8]}
 
