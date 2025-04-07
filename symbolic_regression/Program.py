@@ -1145,9 +1145,10 @@ class Program:
 
         def clean_one_division(program, mutate_point):
             mutate_point_father=mutate_point.father
-            mutate_point_grandfather=mutate_point_father.father
-            
-            if (mutate_point.operands[0].feature==1.0) and (mutate_point.father.symbol == '*'):
+            if mutate_point_father:
+                mutate_point_grandfather=mutate_point_father.father
+    
+            if mutate_point_father and (mutate_point.operands[0].feature==1.0) and (mutate_point.father.symbol == '*'):
                 #replace 1 with feature appearing as the first argument of the product (father) and connect edges
                 index_mutate_point=mutate_point_father.operands.index(mutate_point)
                 mutate_point.operands[0]=mutate_point_father.operands[1-index_mutate_point]
@@ -2110,9 +2111,10 @@ class Program:
 
         def clean_one_division(program, mutate_point):
             mutate_point_father=mutate_point.father
-            mutate_point_grandfather=mutate_point_father.father
-            
-            if (mutate_point.operands[0].feature==1.0) and (mutate_point.father.symbol == '*'):
+            if mutate_point_father:
+                mutate_point_grandfather=mutate_point_father.father
+    
+            if mutate_point_father and (mutate_point.operands[0].feature==1.0) and (mutate_point.father.symbol == '*'):
                 #replace 1 with feature appearing as the first argument of the product (father) and connect edges
                 index_mutate_point=mutate_point_father.operands.index(mutate_point)
                 mutate_point.operands[0]=mutate_point_father.operands[1-index_mutate_point]
