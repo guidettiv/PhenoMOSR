@@ -29,21 +29,26 @@ def one_SR_run():
     parser.add_argument("--dataset", type=str, required=True, help="Dataset name")
     parser.add_argument("--complexity", type=str, required=True, help="Complexity: cstd or cmod")
     parser.add_argument("--pheno_freq", type=str, required=True, help="brgflow, bootstrap, additive mutation freq list  e.g. '[0,2,0]'")
-    parser.add_argument("--genetic_mutations", type=bool, required=True, help="use std genetic mutation?")
-    parser.add_argument("--feature_probability", type=bool, required=False, default=False, help="use non trivial feature probability?")
-    parser.add_argument("--seed", type=int, required=True, help="np seed")
-    parser.add_argument("--n_jobs", type=int, required=True, help="number of jobs")
+    parser.add_argument("--genetic_mutations", type=str, required=True, help="use std genetic mutation?")
+    parser.add_argument("--feature_probability", type=str, required=False, default=False, help="use non trivial feature probability?")
+    parser.add_argument("--seed", type=str, required=True, help="np seed")
+    parser.add_argument("--n_jobs", type=str, required=True, help="number of jobs")
     args = parser.parse_args()
 
+    genetic_mutations=(args.genetic_mutations=='True')
+    bool_feature_probability=(args.feature_probability=='True')
+    seed=int(args.seed)
+    n_jobs=int(args.n_jobs)
 
     import ast
     pheno_freq = ast.literal_eval(args.pheno_freq)
     pheno_freq = [int(x) for x in pheno_freq]
+
+    
     ####################
     ## SET RANDOM SEED
     ####################
-    np.random.seed(seed=args.seed)
-
+    np.random.seed(seed=seed)
 
     ################
     ## OPERATORS
@@ -92,7 +97,7 @@ def one_SR_run():
     #####################################
     ## STATIC/DYNAMIC FEATURE PROBABILITY
     #####################################
-    if args.feature_probability:
+    if bool_feature_probability:
         feature_probability=select_feature_probabilities_regression(train,features,target)
         bool_update_feature_probability=True
     else:
@@ -121,7 +126,7 @@ def one_SR_run():
     ## GENETIC OPERATORS 
     #######################
 
-    if args.genetic_mutations:
+    if genetic_mutations:
         genetic_operators_frequency = {
                                     'crossover': 1,
                                     'mutation': 1,
@@ -141,8 +146,9 @@ def one_SR_run():
     ## CALLBACKS AND PARAMETERS 
     #############################
 
-    file_name = f"./{args.dataset}_{args.complexity}_brg_{pheno_freq[0]}_boot_{pheno_freq[1]}_add_{pheno_freq[2]}_genetic_mut_{str(args.genetic_mutations)}_nontrivial_feat_prob_{str(args.feature_probability)}_seed_{args.seed}"
-
+    file_name = f"./{args.dataset}_{args.complexity}_brg_{pheno_freq[0]}_boot_{pheno_freq[1]}_add_{pheno_freq[2]}_genetic_mut_{str(genetic_mutations)}_nontrivial_feat_prob_{str(bool_feature_probability)}_seed_{seed}"
+    print(f'file name: {file_name}')
+    
     callbacks = [
         MOSRCallbackSaveCheckpoint(
             checkpoint_file=file_name, checkpoint_frequency=1, checkpoint_overwrite=True),
@@ -210,7 +216,7 @@ def one_SR_run():
     data_to_save = [best_prog, string_best_prog, simplicity, r2]
 
     # Save to a file named "my_data.pkl" (you can change the file name as desired)
-    best_res_file=f'./best_prog_{args.dataset}_{args.complexity}_brg_{pheno_freq[0]}_boot_{pheno_freq[1]}_add_{pheno_freq[2]}_genetic_mut_{str(args.genetic_mutations)}_nontrivial_feat_prob_{str(args.feature_probability)}_seed_{args.seed}'
+    best_res_file=f'./best_prog_{args.dataset}_{args.complexity}_brg_{pheno_freq[0]}_boot_{pheno_freq[1]}_add_{pheno_freq[2]}_genetic_mut_{str(genetic_mutations)}_nontrivial_feat_prob_{str(bool_feature_probability)}_seed_{seed}'
     with open(best_res_file+".pkl", "wb") as f:
         pickle.dump(data_to_save, f)
 
