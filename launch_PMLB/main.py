@@ -141,7 +141,7 @@ def one_SR_run():
     ## CALLBACKS AND PARAMETERS 
     #############################
 
-    file_name = f"./{args.dataset}_{args.complexity}_brg_{pheno_freq[0]}_boot_{pheno_freq[1]}_add_{pheno_freq[2]}_genetic_mut_{int(args.genetic_mutations)}_nontrivial_feat_prob_{int(args.feature_probability)}_seed_{args.seed}"
+    file_name = f"./{args.dataset}_{args.complexity}_brg_{pheno_freq[0]}_boot_{pheno_freq[1]}_add_{pheno_freq[2]}_genetic_mut_{str(args.genetic_mutations)}_nontrivial_feat_prob_{str(args.feature_probability)}_seed_{args.seed}"
 
     callbacks = [
         MOSRCallbackSaveCheckpoint(
@@ -210,7 +210,7 @@ def one_SR_run():
     data_to_save = [best_prog, string_best_prog, simplicity, r2]
 
     # Save to a file named "my_data.pkl" (you can change the file name as desired)
-    best_res_file=f'./best_prog_{args.dataset}_{args.complexity}_brg_{pheno_freq[0]}_boot_{pheno_freq[1]}_add_{pheno_freq[2]}_genetic_mut_{int(args.genetic_mutations)}_nontrivial_feat_prob_{int(args.feature_probability)}_seed_{args.seed}'
+    best_res_file=f'./best_prog_{args.dataset}_{args.complexity}_brg_{pheno_freq[0]}_boot_{pheno_freq[1]}_add_{pheno_freq[2]}_genetic_mut_{str(args.genetic_mutations)}_nontrivial_feat_prob_{str(args.feature_probability)}_seed_{args.seed}'
     with open(best_res_file+".pkl", "wb") as f:
         pickle.dump(data_to_save, f)
 
