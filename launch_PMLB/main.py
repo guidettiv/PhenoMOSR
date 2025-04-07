@@ -191,7 +191,7 @@ def one_SR_run():
         fitness_functions=fitness_functions,
         generations_to_train=GENERATIONS,
         training_timeout_mins=TIMEOUT_MINS*100,
-        n_jobs=args.n_jobs,
+        n_jobs=n_jobs,
         stop_at_convergence=False,
         convergence_rolling_window=None,
         verbose=1  # The output could be very verbose. Consider using 0, 1, or 2 to reduce the verbosity
