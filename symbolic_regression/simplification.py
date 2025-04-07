@@ -63,6 +63,9 @@ def extract_operation(element_to_extract: Union[FeatureNode, OperationNode, Inva
     elif str(element.func) == 'Sqrt':
         current_operation = OPERATOR_SQRT
 
+    elif str(element.func) == 'sin':
+        current_operation = OPERATOR_SIN
+
     if current_operation:
         """ Case in which the element is an operation.
         If the element is an operation, we extract the arguments and we create a new OperationNode.
@@ -87,6 +90,7 @@ def extract_operation(element_to_extract: Union[FeatureNode, OperationNode, Inva
             arity=current_operation['arity'],
             format_str=current_operation['format_str'],
             format_tf=current_operation['format_tf'],
+            format_result=current_operation['format_result'],
             symbol=current_operation['symbol'],
             format_diff=current_operation.get(
                 'format_diff', current_operation['format_str']),

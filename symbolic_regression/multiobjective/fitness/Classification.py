@@ -673,6 +673,51 @@ class BCEAkaike(BaseFitness):
             return np.inf
 
 
+
+class BCEBayes(BaseFitness):
+
+    def __init__(self, **kwargs) -> None:
+        """ This fitness requires the following arguments:
+
+        - target: str
+        - weights: str
+        - logistic: bool
+
+        """
+        super().__init__(**kwargs)
+
+    def evaluate(self, program: Program, data: pd.DataFrame, validation: bool = False, pred=None, inject: Dict = dict()) -> float:
+
+        if pred is None:
+            if not validation:
+                self.optimize(program=program, data=data)
+
+            if self.logistic:
+                program_to_evaluate = program.to_logistic(inplace=False)
+            else:
+                program_to_evaluate = program
+
+            nconstants = len(program_to_evaluate.get_constants())
+
+            pred = np.array(program_to_evaluate.evaluate(data=data))
+
+        try:
+            BCE = log_loss(y_true=data[self.target],
+                           y_pred=pred,
+                           sample_weight=data[self.weights] if (self.weights and not validation) else None)
+
+            BIC = (nconstants * np.log(len(data))) / (2 * len(data)) + BCE
+
+            return BIC
+
+        except ValueError:
+            return np.inf
+        except TypeError:
+            return np.inf
+        except UnboundLocalError:
+            return np.inf
+
+
 class ClassificationMinimumDescriptionLength(BaseFitness):
 
     def __init__(self, **kwargs) -> None:
@@ -723,7 +768,7 @@ class ClassificationMinimumDescriptionLength(BaseFitness):
 
             if n_constants == 0:  # No constants in program
                 MDL = NLL + tree_complexity
-                return MDL
+                return MDL/len(data)
 
             # Initialize symbols for variables and constants
             x_sym = ''
@@ -770,7 +815,7 @@ class ClassificationMinimumDescriptionLength(BaseFitness):
             constant_complexity = np.sum(constant_complexities)
 
             MDL = NLL + tree_complexity + constant_complexity
-            return MDL
+            return MDL/len(data)
 
         except TypeError:
             return np.inf

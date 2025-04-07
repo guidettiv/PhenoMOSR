@@ -7,6 +7,56 @@ from symbolic_regression.multiobjective.fitness.Base import BaseFitness
 from symbolic_regression.Program import Program
 
 
+class Average_Wasserstein(BaseFitness):
+
+    def __init__(self, F_ys:list, **kwargs) -> None:
+        """ This method requires the following arguments:
+        - data: pd.DataFrame
+        - target: str
+        - weights: str  # will be calculated, do not provide!
+        - bins: int
+
+        """
+        self.F_ys=F_ys
+        super().__init__(**kwargs)
+
+    def evaluate(self, program: Program, data: pd.DataFrame, validation: bool = False, pred=None,  inject: Dict = dict()) -> float:
+
+        if not hasattr(self, 'F_ys'):
+            self.F_y =[get_cumulant_hist(data=data, target=t, bins=self.bins) for t in self.target]
+
+        features = program.features
+
+        try:
+            y_pred = np.array(program.evaluate(data[features]))
+        except KeyError:
+            return np.inf
+
+        try:
+            rescaled_y_pred = (y_pred-np.min(y_pred)) / \
+                    (np.max(y_pred)-np.min(y_pred))
+            wasserstein_list = []
+            
+            for F_y in self.F_ys:
+                try:
+                    # we add -1 so that wasserstein distance belongs to [0,1]
+                    dy = 1./(F_y.shape[0]-1)               
+                    # compute density function histogram based on target optimal one
+                    pd_y_pred_grid, _ = stats.histogram(
+                        rescaled_y_pred, bins=F_y.shape[0], density=True)
+                    # compute optimal cumulative histogram
+                    F_y_pred = np.sum(dy*pd_y_pred_grid *
+                                      np.tril(np.ones(pd_y_pred_grid.size), 0), 1)       
+                except:
+                    F_y_pred = np.ones_like(F_y)            
+                wasserstein_list.append(dy*np.sum(np.abs(F_y_pred-F_y)))
+                
+            return sum(wasserstein_list) / len(wasserstein_list)         
+        except:            
+            return np.inf
+
+
+
 class Wasserstein(BaseFitness):
 
     def __init__(self, **kwargs) -> None:

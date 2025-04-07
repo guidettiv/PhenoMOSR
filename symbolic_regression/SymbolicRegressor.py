@@ -13,13 +13,14 @@ import zlib
 from itertools import repeat
 from multiprocessing import Process, Queue
 from typing import Any, Dict, List, Tuple, Union
+from joblib import Parallel, delayed
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objs as go
-from loky import get_reusable_executor
 from matplotlib import pyplot as plt
 from scipy.stats import spearmanr
+
 
 from symbolic_regression.callbacks.CallbackBase import MOSRCallbackBase
 from symbolic_regression.multiobjective.fitness.Base import BaseFitness
@@ -27,17 +28,15 @@ from symbolic_regression.multiobjective.hypervolume import _HyperVolume
 from symbolic_regression.Population import Population
 from symbolic_regression.Program import Program
 
-backend_parallel = 'loky'
-
 
 class SymbolicRegressor:
 
-    def __init__(self, client_name: str, const_range: tuple = (0, 1), random_state: int = 42,
+    def __init__(self, client_name: str, const_range: tuple = (0, 1), 
                  parsimony=0.8, parsimony_decay=0.85, population_size: int = 300,
                  tournament_size: int = 3, genetic_operators_frequency: dict = {'crossover': 1, 'mutation': 1},
                  callbacks: List[MOSRCallbackBase] = list(), genetic_algorithm: str = 'NSGA-II',
                  offspring_timeout_condition: tuple = None,
-                 duplicate_drop_by_similarity: bool = False, duplicates_delta_fitness: float = 1e-2,
+                 duplicate_drop_by_similarity: bool = True, duplicates_delta_fitness: float = 1e-2,
                  ) -> None:
         """ This class implements the basic features for training a Symbolic Regression algorithm
 
@@ -47,9 +46,6 @@ class SymbolicRegressor:
 
             - const_range: tuple (default: (0, 1))
                 this is the range of values from which to generate constants in the program
-
-            - random_state: int (default: 42)
-                the random state to be used in the training
 
             - parsimony: float (default: 0.8)
                 the ratio to which a new operation is chosen instead of a terminal node in program generations
@@ -103,11 +99,12 @@ class SymbolicRegressor:
         # Regressor Configuration
         self.client_name: str = client_name
         self.features: List = None
+        self.feature_probability = None
+        self.bool_update_feature_probability = None
         self.offspring_timeout_condition: tuple = offspring_timeout_condition
         self.operations: List = None
         self.population_size: int = population_size
-        self.random_state: int = random_state
-        random.seed(self.random_state)
+
 
         # Population Configuration
         self.population: Population = Population()
@@ -118,6 +115,10 @@ class SymbolicRegressor:
         self.tournament_size: int = tournament_size
         self.duplicates_delta_fitness: float = duplicates_delta_fitness
         self.duplicates_drop_by_similarity: bool = duplicate_drop_by_similarity
+
+        ## degbugging phenotipic operations
+        self.nr_success_brgflow: int = 0
+        self.nr_success_bootstrap: int = 0
 
         # Training Configuration
         self.data_shape: tuple = None
@@ -132,6 +133,7 @@ class SymbolicRegressor:
         self._stop_at_convergence: bool = False
         self._convergence_rolling_window: int = None
         self._convergence_rolling_window_threshold: float = 0.01
+        self.training_timeout_mins: int = -1
         self._nadir_points: Dict = dict()
         self._ideal_points: Dict = dict()
         self._fpf_fitness_history: Dict = dict()
@@ -661,7 +663,7 @@ class SymbolicRegressor:
         if self.verbose > 1:
             print(
                 f"\tDuplicates: finding duplicates {(index+1)/len(complexities_index):.1%}. Completed!", end='\n')
-            
+
         if inplace:
             self.population: Population = Population(
                 filter(lambda p: p._is_duplicated == False, self.population))
@@ -723,7 +725,22 @@ class SymbolicRegressor:
         """
         return self.extract_pareto_front(population=self.population, rank=1)
 
-    def fit(self, data: Union[dict, pd.DataFrame, pd.Series], features: List[str], operations: List[dict], fitness_functions: List[BaseFitness], generations_to_train: int, n_jobs: int = -1, stop_at_convergence: bool = False, convergence_rolling_window: int = None, convergence_rolling_window_threshold: float = 0.01, verbose: int = 0, val_data: Union[dict, pd.DataFrame, pd.Series] = None) -> None:
+    def fit(self, 
+            data: Union[dict, pd.DataFrame, pd.Series], 
+            features: List[str], 
+            feature_probability: List[float], 
+            operations: List[dict], 
+            fitness_functions: List[BaseFitness], 
+            generations_to_train: int, 
+            n_jobs: int = -1, 
+            bool_update_feature_probability: bool = False, 
+            stop_at_convergence: bool = False, 
+            convergence_rolling_window: int = None, 
+            convergence_rolling_window_threshold: float = 0.01, 
+            verbose: int = 0, 
+            val_data: Union[dict, pd.DataFrame, pd.Series] = None, 
+            adjust_feature_probability: bool = False,
+            training_timeout_mins: int = -1) -> None:
         """
         This method trains the population.
 
@@ -763,8 +780,11 @@ class SymbolicRegressor:
             - None
         """
         self.features = features
+        self.feature_probability = feature_probability
+        self.bool_update_feature_probability = bool_update_feature_probability
+        self.adjust_feature_probability = adjust_feature_probability
         self.operations = operations
-
+    
         self.data_shape = data.shape
 
         self.fitness_functions = fitness_functions
@@ -773,21 +793,13 @@ class SymbolicRegressor:
         self.stop_at_convergence = stop_at_convergence
         self.convergence_rolling_window = convergence_rolling_window
         self.convergence_rolling_window_threshold = convergence_rolling_window_threshold
+        self.training_timeout_mins = training_timeout_mins
         self.verbose = verbose
-
-        self.procs: List[Process] = list()
 
         start = time.perf_counter()
         try:
             self._fit(data=data, val_data=val_data)
         except KeyboardInterrupt:
-            for proc in self.procs:
-                try:
-                    proc.kill()
-                except:
-                    pass
-
-            self.procs = list()
 
             self.generation -= 1  # The increment is applied even if the generation is interrupted
             self.status = "Interrupted by KeyboardInterrupt"
@@ -798,6 +810,7 @@ class SymbolicRegressor:
 
         stop = time.perf_counter()
         self.training_duration += stop - start
+
 
     def _fit(self, data: Union[dict, pd.DataFrame, pd.Series], val_data: Union[dict, pd.DataFrame, pd.Series] = None) -> None:
         """
@@ -831,8 +844,7 @@ class SymbolicRegressor:
         """
         total_generation_time = 0
         jobs = self.n_jobs if self.n_jobs > 0 else os.cpu_count()
-
-        executor = get_reusable_executor(max_workers=jobs, timeout=100)
+        fit_start = time.perf_counter()
 
         if not self.population:
 
@@ -845,29 +857,31 @@ class SymbolicRegressor:
                     logging.warning(
                         traceback.format_exc())
 
-            before = time.perf_counter()
             if self.verbose > 0:
                 print(f"Initializing population")
             self.status = "Generating population"
 
-            self.population = Population(executor.map(
-                lambda p: self.generate_individual(*p),
-                zip(
-                    repeat(copy.deepcopy(data), self.population_size),
-                    repeat(self.features, self.population_size),
-                    repeat(self.operations, self.population_size),
-                    repeat(copy.deepcopy(self.fitness_functions),
-                           self.population_size),
-                    repeat(self.const_range, self.population_size),
-                    repeat(self.random_state, self.population_size),
-                    repeat(self.parsimony, self.population_size),
-                    repeat(self.parsimony_decay, self.population_size),
-                    repeat(copy.deepcopy(val_data), self.population_size),
-                )
-            ))
+        
+            results = Parallel(n_jobs=jobs)(
+                        delayed(self.generate_individual)(
+                            data=data,
+                            features=self.features,
+                            feature_probability=self.feature_probability,
+                            bool_update_feature_probability = self.bool_update_feature_probability,
+                            operations=self.operations,
+                            fitness_functions=self.fitness_functions,
+                            const_range=self.const_range,
+                            parsimony=self.parsimony,
+                            parsimony_decay=self.parsimony_decay,
+                            val_data=val_data
+                        )
+                        for _ in range(self.population_size)
+                    )
+            
+            self.population = Population(results)
 
             self.times.loc[self.generation+1,
-                           "time_initialization"] = time.perf_counter() - before
+                           "time_initialization"] = time.perf_counter() - fit_start
 
             for c in self.callbacks:
                 try:
@@ -887,31 +901,38 @@ class SymbolicRegressor:
             logging.info(
                 f"Fitting with existing population of {len(self.population)} valid elements")
 
+
             if len(self.population) < self.population_size:
                 logging.info(
                     f"Population of {len(self.population)} elements is less than population_size:{self.population_size}. Integrating with new elements")
                 new_individuals = self.population_size - len(self.population)
-                refill_training_start = Population(executor.map(
-                    lambda p: self.generate_individual(*p),
-                    zip(
-                        repeat(data, new_individuals),
-                        repeat(self.features, new_individuals),
-                        repeat(self.operations, new_individuals),
-                        repeat(self.fitness_functions,
-                               new_individuals),
-                        repeat(self.const_range, new_individuals),
-                        repeat(self.random_state, new_individuals),
-                        repeat(self.parsimony, new_individuals),
-                        repeat(self.parsimony_decay, new_individuals),
-                        repeat(val_data, new_individuals),
+                refill_training_start = Parallel(n_jobs=jobs)(
+                        delayed(self.generate_individual)(
+                            data=data,
+                            features=self.features,
+                            feature_probability=self.feature_probability,
+                            bool_update_feature_probability = self.bool_update_feature_probability,
+                            operations=self.operations,
+                            fitness_functions=self.fitness_functions,
+                            const_range=self.const_range,
+                            parsimony=self.parsimony,
+                            parsimony_decay=self.parsimony_decay,
+                            val_data=val_data
+                        )
+                        for _ in range(new_individuals)
                     )
-                ))
+            
+                refill_training_start = Population(refill_training_start)
 
                 self.population.extend(refill_training_start)
                 self.population = Population(self.population)
 
+                self.times.loc[self.generation+1,
+                           "time_initialization"] = time.perf_counter() - fit_start
+
         while True:
             self.status = "Training"
+            start_time_generation = time.perf_counter()
 
             if self.generation > 0 and self.generations_to_train <= self.generation:
                 logging.info(
@@ -927,8 +948,6 @@ class SymbolicRegressor:
                         f"Callback {c.__class__.__name__} raised an exception on generation start")
                     logging.warning(
                         traceback.format_exc())
-
-            start_time_generation = time.perf_counter()
 
             for p in self.population:
                 p.programs_dominates: List[Program] = list()  # type: ignore
@@ -963,7 +982,7 @@ class SymbolicRegressor:
                 print(
                     f"{self.client_name}: starting generation {self.generation}/{self.generations_to_train} ({self.genetic_algorithm})", end='\r' if self.verbose == 1 else '\n', flush=True)
 
-            before = time.perf_counter()
+            start_offspring = time.perf_counter()
 
             #################################################################################
             #################################################################################
@@ -982,87 +1001,119 @@ class SymbolicRegressor:
 
             self.status = "Generating Offsprings"
 
-            offsprings: List[Program] = list()
-            self.procs: List[Process] = list()
+            """
+            Generates `population_size` offspring in parallel batches using joblib.
+            Preserves:
+            1. Running count of offspring generated
+            2. Early stopping if generation is too slow or takes too long
+            """
+            too_long=False
 
-            '''
-            In this part of the code we generate the offsprings based on the genetic algorithm.
-            The process assumes that the offspring list is populated with the new programs
-            '''
-            queue = multiprocessing.Manager().Queue(maxsize=self.population_size)
+            jobs = self.n_jobs if self.n_jobs > 0 else os.cpu_count()
 
-            for _ in range(jobs):
+            offsprings: List[Program] = []
+            start_time = time.perf_counter()
+
+            # We'll generate offspring in batches until we reach population_size
+            # or until the time-based condition says "stop."
+            while len(offsprings) < self.population_size:
+
+                elapsed_s = time.perf_counter() - start_time
+
+                # ------------------------------------------------------------
+                # Check your "timeout condition"
+                # offspring_timeout_condition might be a tuple like (max_time, min_rate)
+                # If (elapsed_s > max_time) AND (offspring_per_second < min_rate),
+                # we trigger an early stop.
+                # ------------------------------------------------------------
+                if (isinstance(self.offspring_timeout_condition, tuple)
+                    and elapsed_s > self.offspring_timeout_condition[0]
+                    and (len(offsprings) / max(elapsed_s, 1e-9) < self.offspring_timeout_condition[1])
+                ):
+                    logging.warning(
+                        f"Offspring generation got too slow; only {len(offsprings)}/{self.population_size} "
+                        f"generated in {int(elapsed_s)}s. Aborting early."
+                    )
+                    too_long = True
+                    break
+
+                # ------------------------------------------------------------
+                # Decide how many to generate in this batch
+                # e.g.,  you can spawn `jobs` parallel tasks, each of which returns
+                # a list of new offspring from _get_offspring_batch.
+                # ------------------------------------------------------------
+                needed = self.population_size - len(offsprings)
+                batch_tasks = needed # min(5*jobs, needed)
+
+                # Make a local copy of the population (if needed),
+                # or call .as_binary() if your code requires it
                 try:
                     population_to_pass = self.population.as_binary()
                 except AttributeError:
                     population_to_pass = self.population
-                proc = Process(
-                    target=self._get_offspring_batch,
-                    args=(
-                        data,
-                        self.genetic_operators_frequency,
-                        self.fitness_functions,
-                        population_to_pass,
-                        self.tournament_size,
-                        self.generation,
-                        int(1.5 * max(os.cpu_count(),
-                            self.population_size/jobs)),
-                        queue,
-                        val_data
+
+                # ------------------------------------------------------------
+                # Run this batch in parallel via joblib
+                # Each delayed(...) call spawns a chunk of new offspring
+                # ------------------------------------------------------------
+                results = Parallel(n_jobs=jobs)(
+                    delayed(self._generate_one_offspring)(
+                        data=data,
+                        genetic_operators_frequency=self.genetic_operators_frequency,
+                        fitness_functions=self.fitness_functions,
+                        population=population_to_pass,
+                        tournament_size=self.tournament_size,
+                        generation = self.generation,
+                        val_data = val_data
                     )
+                    for _ in range(batch_tasks)
                 )
-                self.procs.append(proc)
+                # `results` is now a list of lists 
+                # unpack them into `offsprings`, nr_brgflow, nr_bootstrap
+                # zip(*list_of_lists) effectively "rotates" the rows into columns
+                children, nr_brgflow, nr_bootstrap = zip(*results)
 
-            was_limited_str = ''
-            for index, proc in enumerate(self.procs):
-                proc.start()
+                # zip returns tuples, so to make children a list:
+                offsprings+=list(children)
+                self.nr_success_brgflow += sum(nr_brgflow)
+                self.nr_success_bootstrap += sum(nr_bootstrap)
 
-            q_size = 0
-            _elapsed_s = 1
+            
 
-            too_long = False
+                    
+                
 
-            while q_size < self.population_size and not too_long:
-                q_size = queue.qsize()
-
-                if isinstance(self.offspring_timeout_condition, tuple) and _elapsed_s > self.offspring_timeout_condition[0] and q_size/_elapsed_s < self.offspring_timeout_condition[1]:
-                    too_long = True
-
-                # Make sure at least some processes are alive
+                # ------------------------------------------------------------
+                # Print progress if verbose
+                # ------------------------------------------------------------
                 if self.verbose > 1:
-
-                    _elapsed_s = max(
-                        1, int(round(time.perf_counter() - before)))
-                    _elapsed = datetime.timedelta(seconds=_elapsed_s)
-
+                    curr_count = len(offsprings)
+                    elapsed_s = max(time.perf_counter() - start_time, 1e-9)
+                    ops_s = round(curr_count / elapsed_s, 2)
+                    elapsed_td = datetime.timedelta(seconds=int(elapsed_s))
                     print(
-                        f'Offsprings generated: {q_size}/{self.population_size} ({_elapsed}, {round(q_size/_elapsed_s, 2)} /s) {was_limited_str}', end='\r', flush=True)
-                time.sleep(.2)
+                        f"Offsprings generated: {curr_count}/{self.population_size} "
+                        f"({elapsed_td}, {ops_s} /s) ...",
+                        end="\r",
+                        flush=True
+                    )
 
-            else:
-                if too_long:
-                    logging.warning(
-                        f"Offsprings generation got too slow and was interrupted: {_elapsed}. {q_size}/{self.population_size} offsprings generated.")
-                    was_limited_str = ' (was limited by time)'
+                # Sleep or not – depends on whether you want to slow the loop
+                # time.sleep(0.2)  # sometimes helpful to reduce console spam
 
-                q_size = queue.qsize()
-                if self.verbose > 1:
-                    _elapsed_s = max(
-                        1, int(round(time.perf_counter() - before)))
-                    _elapsed = datetime.timedelta(seconds=_elapsed_s)
-                    print(
-                        f'Offsprings generated: {q_size}/{self.population_size} ({_elapsed}, {round(q_size/_elapsed_s, 2)} /s). Completed!  {was_limited_str}   ', flush=True)
-
-            for i in range(min(self.population_size, q_size)):
-                offsprings.append(queue.get())
-
-            for proc in self.procs:
-                proc.kill()
-
-            self.procs = list()
+            # Finished or aborted early
+            if self.verbose > 1:
+                total = len(offsprings)
+                elapsed_s = max(time.perf_counter() - start_time, 1e-9)
+                ops_s = round(total / elapsed_s, 2)
+                elapsed_td = datetime.timedelta(seconds=int(elapsed_s))
+                print(
+                    f"\nOffsprings generated: {total}/{self.population_size} "
+                    f"({elapsed_td}, {ops_s} /s). Completed!"
+                )
 
             self.times.loc[self.generation,
-                           "time_offsprings_generation"] = time.perf_counter() - before
+                           "time_offsprings_generation"] = time.perf_counter() - start_offspring
             self.times.loc[self.generation,
                            "time_offsprings_generation_capped"] = too_long
 
@@ -1082,42 +1133,58 @@ class SymbolicRegressor:
             # Offsprings generation end
             #################################################################################
             #################################################################################
+            # Check duplicates and invalids
+            #################################################################################
+            #################################################################################
 
             # Removes all duplicated programs in the population
+            start_drop_duplicates = time.perf_counter()
+
             before_cleaning = len(self.population)
-
-            before = time.perf_counter()
             self.drop_duplicates(inplace=True)
-            self.times.loc[self.generation,
-                           "time_duplicated_drop"] = time.perf_counter() - before
-
+            
             after_drop_duplicates = len(self.population)
             logging.debug(
                 f"{before_cleaning-after_drop_duplicates}/{before_cleaning} duplicates programs removed")
-
-            self.times.loc[self.generation,
-                           "count_duplicated_elements"] = before_cleaning-after_drop_duplicates
+            
             self.times.loc[self.generation, "ratio_duplicated_elements"] = (
                 before_cleaning-after_drop_duplicates)/before_cleaning
+            
+            self.times.loc[self.generation,
+                           "count_duplicated_elements"] = before_cleaning-after_drop_duplicates
+            
+            self.times.loc[self.generation,
+                           "time_duplicated_drop"] = time.perf_counter() - start_drop_duplicates
+
 
             # Removes all non valid programs in the population
-            before = time.perf_counter()
+            start_drop_invalids = time.perf_counter()
+            
             self.drop_invalids(inplace=True)
-            self.times.loc[self.generation,
-                           "time_invalids_drop"] = time.perf_counter() - before
-
+            
             after_cleaning = len(self.population)
             if before_cleaning != after_cleaning:
                 logging.debug(
                     f"{after_drop_duplicates-after_cleaning}/{after_drop_duplicates} invalid programs removed")
+            
+            self.times.loc[self.generation,
+                           "time_invalids_drop"] = time.perf_counter() - start_drop_invalids
+
+            #################################################################################
+            #################################################################################
+            # Refill population starts
+            #################################################################################
+            #################################################################################
 
             # Integrate population in case of too many invalid programs
             if len(self.population) < self.population_size * 2:
+                start_refill_population = time.perf_counter()
                 self.status = "Refilling Individuals"
-
-                before = time.perf_counter()
-                missing_elements = 2*self.population_size - \
+                
+                missing_elements = 2 * self.population_size - \
                     len(self.population)
+                
+                refill: List[Program] = list()
 
                 logging.debug(
                     f"Population of {len(self.population)} elements is less than 2*population_size:{self.population_size*2}. Integrating with {missing_elements} new elements")
@@ -1130,66 +1197,82 @@ class SymbolicRegressor:
                             f"Callback {c.__class__.__name__} raised an exception on refill start")
                         logging.warning(
                             traceback.format_exc())
+                        
+                while len(refill) < missing_elements:
+                    elapsed_s = time.perf_counter() - start_refill_population
 
-                refill: List[Program] = list()
-                self.procs: List[Process] = list()
-                queue = multiprocessing.Manager().Queue(maxsize=missing_elements)
+                    # ------------------------------------------------------------
+                    # Decide how many to generate in this batch
+                    # e.g.,  you can spawn `jobs` parallel tasks, each of which returns
+                    # a list of new offspring from _get_offspring_batch.
+                    # ------------------------------------------------------------
+                    needed = missing_elements - len(refill)
+                    batch_tasks = needed #min(5*jobs, needed)
 
-                for _ in range(jobs):
-                    proc = Process(
-                        target=self.generate_individual_batch,
-                        args=(
-                            data,
-                            self.features,
-                            self.operations,
-                            self.fitness_functions,
-                            self.const_range,
-                            self.random_state,
-                            self.parsimony,
-                            self.parsimony_decay,
-                            int(1.5 * max(os.cpu_count(), missing_elements/jobs)),
-                            queue,
-                            val_data
-                        )
-                    )
-                    self.procs.append(proc)
-                    proc.start()
-
-                q_size = 0
-                while q_size < missing_elements:
-                    q_size = queue.qsize()
-                    if self.verbose > 1:
-                        _elapsed_s = max(
-                            1, int(round(time.perf_counter() - before)))
-                        _elapsed = datetime.timedelta(seconds=_elapsed_s)
-                        print(
-                            f'Duplicates/invalid refilled: {q_size}/{missing_elements} ({_elapsed}, {round(q_size/_elapsed_s, 2)} /s)', end='\r', flush=True)
-                    time.sleep(.5)
-
-                else:
-                    if self.verbose > 1:
-                        _elapsed_s = max(
-                            1, int(round(time.perf_counter() - before)))
-                        _elapsed = datetime.timedelta(seconds=_elapsed_s)
-                        print(
-                            f'Duplicates/invalid refilled: {q_size}/{missing_elements} ({_elapsed}, {round(q_size/_elapsed_s, 2)} /s). Completed!', flush=True)
-                    for p in self.procs:
-                        if p.is_alive():
-                            p.join(timeout=.1)
-
-                for _ in range(missing_elements):
-                    refill.append(queue.get())
-
-                for proc in self.procs:
+                    # Make a local copy of the population (if needed),
+                    # or call .as_binary() if your code requires it
                     try:
-                        proc.kill()
-                    except:
-                        pass
+                        population_to_pass = self.population.as_binary()
+                    except AttributeError:
+                        population_to_pass = self.population
 
-                self.procs = list()
+                    # ------------------------------------------------------------
+                    # Run this batch in parallel via joblib
+                    # Each delayed(...) call spawns a chunk of new offspring
+                    # ------------------------------------------------------------
+                    results = Parallel(n_jobs=jobs)(
+                        delayed(self.generate_individual)(
+                            data=data,
+                            features=self.features,
+                            feature_probability=self.feature_probability,
+                            bool_update_feature_probability = self.bool_update_feature_probability,
+                            operations=self.operations,
+                            fitness_functions=self.fitness_functions,
+                            const_range=self.const_range,
+                            parsimony=self.parsimony,
+                            parsimony_decay=self.parsimony_decay,
+                            val_data=val_data
+                        )
+                        for _ in range(batch_tasks)
+                    )
+                    # `results` is now a list (each from _get_offspring_batch)
+                    # Flatten them into `offsprings`
+                        
+                    refill += results
+
+                    # ------------------------------------------------------------
+                    # Print progress if verbose
+                    # ------------------------------------------------------------
+                    if self.verbose > 1:
+                        curr_count = len(refill)
+                        elapsed_s = max(time.perf_counter() - start_refill_population, 1e-9)
+                        ops_s = round(curr_count / elapsed_s, 2)
+                        elapsed_td = datetime.timedelta(seconds=int(elapsed_s))
+                        print(
+                            f"Refilling progress: {curr_count}/{self.population_size} "
+                            f"({elapsed_td}, {ops_s} /s) ...",
+                            end="\r",
+                            flush=True
+                        )
+
+                    # Sleep or not – depends on whether you want to slow the loop
+                    # time.sleep(0.2)  # sometimes helpful to reduce console spam
+
+                # Finished or aborted early
+                if self.verbose > 1:
+                    total = len(refill)
+                    elapsed_s = max(time.perf_counter() - start_refill_population, 1e-9)
+                    ops_s = round(total / elapsed_s, 2)
+                    elapsed_td = datetime.timedelta(seconds=int(elapsed_s))
+                    print(
+                        f"\nOffsprings generated: {total}/{self.population_size} "
+                        f"({elapsed_td}, {ops_s} /s). Completed!"
+                    )
+
 
                 self.population: Population = Population(
                     self.population + refill)
+                
 
                 for c in self.callbacks:
                     try:
@@ -1205,11 +1288,20 @@ class SymbolicRegressor:
                     p for p in self.population if not p._has_incomplete_fitness]
 
                 self.times.loc[self.generation,
-                               "time_refill_invalid"] = time.perf_counter() - before
+                               "time_refill_invalid"] = time.perf_counter() - start_refill_population
                 self.times.loc[self.generation,
                                "count_invalid_elements"] = missing_elements
                 self.times.loc[self.generation,
                                "ratio_invalid_elements"] = missing_elements / len(self.population)
+
+            #################################################################################
+            #################################################################################
+            # Refill population stops
+            #################################################################################
+            #################################################################################
+            start_pareto_front_computation = time.perf_counter()
+
+            self.status = "Pareto Front Computation"
 
             for c in self.callbacks:
                 try:
@@ -1220,29 +1312,31 @@ class SymbolicRegressor:
                     logging.warning(
                         traceback.format_exc())
 
-            self.status = "Pareto Front Computation"
 
             # Calculates the Pareto front
-            before = time.perf_counter()
             self._create_pareto_front()
             self.times.loc[self.generation,
-                           "time_pareto_front_computation"] = time.perf_counter() - before
+                           "time_pareto_front_computation"] = time.perf_counter() - start_pareto_front_computation
 
-            # Calculates the crowding distance
-            before = time.perf_counter()
+            # Calculates srecond selection criterion
+            start_second_criterion_computation = time.perf_counter()
+
             if self.genetic_algorithm == 'NSGA-II':
                 self.population = self._select_final_population_NSGAII()
 
             elif self.genetic_algorithm == 'SMS-EMOEA':
                 self.population = self._select_final_population_SMS_EMOEA()
 
-            self.times.loc[self.generation,
-                           "time_second_selection_criterion_computation"] = time.perf_counter() - before
-
+            
             self.population = Population(self.population)
 
             self.times.loc[self.generation,
                            "count_average_complexity"] = self.average_complexity
+
+            self.times.loc[self.generation,
+                           "time_second_selection_criterion_computation"] = time.perf_counter() - start_second_criterion_computation
+
+
 
             ###### Convergence check START ######
             self._fpf_fitness_history[self.generation] = [
@@ -1281,8 +1375,8 @@ class SymbolicRegressor:
                     logging.warning(
                         traceback.format_exc())
 
-            end_time_generation = time.perf_counter()
             self._print_first_pareto_front(verbose=self.verbose)
+            end_time_generation = time.perf_counter()
 
             total_generation_time = end_time_generation - start_time_generation
             self.times.loc[self.generation,
@@ -1298,7 +1392,9 @@ class SymbolicRegressor:
                         traceback.format_exc())
 
             # Use generations = -1 to rely only on convergence (risk of infinite loop)
-            if self.generations_to_train > 0 and self.generation == self.generations_to_train:
+            bool_timeout = (time.perf_counter()- fit_start + self.times['time_generation_total'].tail(5).mean()) > self.training_timeout_mins*60
+            bool_generation = (self.generation == self.generations_to_train)
+            if (self.generations_to_train > 0 and bool_generation) or (self.training_timeout_mins > 0 and bool_timeout):
                 for c in self.callbacks:
                     try:
                         c.on_training_completed()
@@ -1331,8 +1427,9 @@ class SymbolicRegressor:
                 return
 
     def generate_individual(self,
-                            data: Union[dict, pd.DataFrame, pd.Series], features: List[str], operations: List[dict],
-                            fitness_functions: List[BaseFitness], const_range: tuple = (0, 1), random_state: int = 42,
+                            data: Union[dict, pd.DataFrame, pd.Series], features: List[str],
+                            feature_probability: List[float], bool_update_feature_probability: bool, operations: List[dict],
+                            fitness_functions: List[BaseFitness], const_range: tuple = (0, 1),
                             parsimony: float = 0.8, parsimony_decay: float = 0.85,
                             val_data: Union[dict, pd.DataFrame, pd.Series] = None) -> Program:
         """
@@ -1350,8 +1447,6 @@ class SymbolicRegressor:
             - const_range: tuple
                 The range of the constants to be used in the generation. There will then be
                 adapted during the optimization process.
-            - random_state: int (default 42)
-                The random state to be used in the generation
             - fitness_functions: List[BaseFitness]
                 The list of fitness functions to be used in the generation
             - parsimony: float (default 0.8)
@@ -1370,92 +1465,32 @@ class SymbolicRegressor:
                 The generated program
 
         """
-        if isinstance(random_state, int):
-            random.seed(random_state)
 
-        new_p = Program(features=features, operations=operations, const_range=const_range,
-                        parsimony=parsimony, parsimony_decay=parsimony_decay)
+        new_p = Program(features=features, 
+                        feature_probability=feature_probability,
+                        default_feature_probability=feature_probability,
+                        bool_update_feature_probability=bool_update_feature_probability,
+                        operations=operations, 
+                        const_range=const_range,
+                        parsimony=parsimony, 
+                        parsimony_decay=parsimony_decay)
+
         new_p.init_program()
         new_p.compute_fitness(fitness_functions=fitness_functions,
                               data=data, validation=False, simplify=True)
+        
+        ## COMPUTE FEATURE PROBABILITY
+        if new_p.bool_update_feature_probability:
+            new_p.feature_probability=new_p.update_feature_probability(data=data)
 
         if val_data is not None:
             new_p.compute_fitness(
                 fitness_functions=fitness_functions, data=val_data, validation=True)
+        
+        #print(f'New p: {new_p.program}\nFeature prob. {new_p.feature_probability}\nDefault Feature prob. {new_p.default_feature_probability}\n\n')
 
         return new_p
 
-    def generate_individual_batch(self, data: Union[dict, pd.DataFrame, pd.Series],
-                                  features: List[str], operations: List[dict],
-                                  fitness_functions: List[BaseFitness], const_range: tuple = (0, 1), random_state: int = 42,
-                                  parsimony: float = 0.8, parsimony_decay: float = 0.85, batch_size: int = 1000,
-                                  queue: Queue = None, val_data: Union[dict, pd.DataFrame, pd.Series] = None) -> Program:
-        """
-        This method generates a new individual for the population
-
-        Args:
-            - data: Union[dict, pd.DataFrame, pd.Series]
-                The data on which the performance are evaluated. We could use compute_fitness
-                later, but we need to evaluate the fitness here to compute it in the
-                parallel initialization.
-            - features: List[str]
-                The list of features to be used in the generation
-            - operations: List[dict]
-                The list of operations to be used in the generation
-            - const_range: tuple
-                The range of the constants to be used in the generation. There will then be
-                adapted during the optimization process.
-            - random_state: int (default 42)
-                The random state to be used in the generation
-            - fitness_functions: List[BaseFitness]
-                The list of fitness functions to be used in the generation
-            - parsimony: float (default 0.8)
-                The parsimony coefficient to be used in the generation. This modulates how
-                likely the program is to be complex (deep) or simple (shallow).
-            - parsimony_decay: float (default 0.85)
-                The parsimony decay to be used in the generation. This modulates how the parsimony
-                coefficient is updated at each generation. The parsimony coefficient is multiplied
-                by this value at each generation. This allows to decrease the parsimony coefficient
-                over time to prevent the program to be too complex (deep).
-            - batch_size: int (default 1000)
-                The number of individuals to generate
-            - queue: Queue (default None)
-                The queue in which to put the generated individuals
-            - val_data: Union[dict, pd.DataFrame, pd.Series] (default None)
-                The data on which the validation is performed
-
-        Returns:
-            - p: Program
-                The generated program
-
-        """
-
-        if isinstance(random_state, int):
-            random.seed(random_state)
-
-        new_ps: List[Program] = list()
-
-        submitted = 0
-        while submitted < batch_size * 3:
-
-            if not self.status == "Refilling Individuals":
-                return
-
-            new_p = self.generate_individual(data=data, features=features, operations=operations,
-                                             fitness_functions=fitness_functions, const_range=const_range, random_state=random_state,
-                                             parsimony=parsimony, parsimony_decay=parsimony_decay, val_data=val_data)
-
-            if new_p._has_incomplete_fitness:
-                continue
-
-            if queue is not None:
-                queue.put(new_p)
-            else:
-                new_ps.append(new_p)
-
-            submitted += 1
-
-        return new_ps
 
     def _tournament_selection(self, population: Population, tournament_size: int, generation: int) -> Program:
         """
@@ -1565,117 +1600,193 @@ class SymbolicRegressor:
         # Select the genetic operation to apply
         # The frequency of each operation is determined by the dictionary
         # genetic_operators_frequency. The higher the number the likelier the operation will be chosen.
+        successfull_brgflow=0
+        successfull_bootstrap=0
 
         ops = list()
         for op, freq in genetic_operators_frequency.items():
             ops += [op] * freq
         gen_op = random.choice(ops)
 
+
         program1 = self._tournament_selection(
             population=population, tournament_size=tournament_size, generation=generation)
 
-        if program1 is None or not program1.is_valid:
-            # If the program is not valid, we return a the same program without any alteration
-            # because it would be unlikely to generate a valid offspring.
-            # This program will be removed from the population later.
-            program1.init_program()
-            program1.compute_fitness(
+        #print(f'Program {program1.program} undergoes {gen_op}.\nProgram1 feat prob {program1.feature_probability}\nProgram1 default feat prob {program1.default_feature_probability}\n')
+        if  not program1.is_valid:
+            # If the program is not valid, we return a random tree.
+            # The invalid program will be removed from the population later.
+            #print(f'Program 1 not valid. ')
+            new = Program(operations=program1.operations,
+                        features=program1.features,
+                        feature_probability=program1.default_feature_probability,
+                        default_feature_probability=program1.default_feature_probability,
+                        bool_update_feature_probability=program1.bool_update_feature_probability,
+                        const_range=program1.const_range,
+                        parsimony=program1.parsimony,
+                        parsimony_decay=program1.parsimony_decay)
+
+            new.init_program()
+            new.compute_fitness(
                 fitness_functions=fitness_functions, data=data, validation=False, simplify=True)
             if val_data is not None:
-                program1.compute_fitness(
+                new.compute_fitness(
                     fitness_functions=fitness_functions, data=val_data, validation=True, simplify=False)
-            return program1
+            #print(f'New program {new.program}.\n')
+            return new, successfull_brgflow, successfull_bootstrap
 
         _offspring: Program = None
         if gen_op == 'crossover':
             program2 = self._tournament_selection(
                 population=population, tournament_size=tournament_size, generation=generation)
-            if program2 is None or not program2.is_valid:
-                return program1
+            if not program2.is_valid:
+                new = Program(operations=program2.operations,
+                            features=program2.features,
+                            feature_probability=program2.default_feature_probability,
+                            default_feature_probability=program2.default_feature_probability,
+                            bool_update_feature_probability=program2.bool_update_feature_probability,
+                            const_range=program2.const_range,
+                            parsimony=program2.parsimony,
+                            parsimony_decay=program2.parsimony_decay)
+
+                new.init_program()
+                new.compute_fitness(
+                    fitness_functions=fitness_functions, data=data, validation=False, simplify=True)
+                if val_data is not None:
+                    new.compute_fitness(
+                        fitness_functions=fitness_functions, data=val_data, validation=True, simplify=False)
+                return new, successfull_brgflow, successfull_bootstrap
+            
             _offspring = program1.cross_over(
                 other=program2, inplace=False)
+            simplify=True
 
         elif gen_op == 'randomize':
             # Will generate a new tree as other
             _offspring = program1.cross_over(other=None, inplace=False)
+            simplify=True
 
         elif gen_op == 'mutation':
             _offspring = program1.mutate(inplace=False)
+            simplify=True
 
         elif gen_op == 'delete_node':
             _offspring = program1.delete_node(inplace=False)
+            simplify=True
 
         elif gen_op == 'insert_node':
             _offspring = program1.insert_node(inplace=False)
+            simplify=True
 
         elif gen_op == 'mutate_operator':
             _offspring = program1.mutate_operator(inplace=False)
+            simplify=True
 
         elif gen_op == 'mutate_leaf':
             _offspring = program1.mutate_leaf(inplace=False)
+            simplify=True
 
         elif gen_op == 'simplification':
             _offspring = program1.simplify(inplace=False)
+            simplify=True
 
         elif gen_op == 'recalibrate':
             _offspring = program1.recalibrate(inplace=False)
+            simplify=True
 
-        elif gen_op == 'do_nothing':
-            _offspring = program1
+        elif gen_op == 'regularize_brgflow':
+            _offspring, successfull_brgflow = program1.regularize_brgflow(data=data,
+                                                     inplace=False)
+            #if successfull_brgflow==1:
+            #    print('successfull brg')
+            simplify=False
+        
+        elif gen_op == 'regularize_bootstrap':
+            _offspring, successfull_bootstrap = program1.regularize_bootstrap(data=data,
+                                                       inplace=False)
+            #if successfull_bootstrap==1:
+            #    print('successfull boostrap')
+            simplify=False
+        
+        elif gen_op == 'additive_expansion':
+            _offspring = program1.additive_expansion(inplace=False)
+            simplify=True
+
         else:
             logging.warning(
                 f'Supported genetic operations: crossover, delete_node, do_nothing, insert_node, mutate_leaf, mutate_operator, simplification, mutation and randomize'
             )
 
+            print('asking for non-existing mutations!!!!')
             return program1
 
-        # Add the fitness to the object after the cross_over or mutation
+        # Add the fitness to the object after the genetic operation
         _offspring.compute_fitness(
-            fitness_functions=fitness_functions, data=data, simplify=True)
+            fitness_functions=fitness_functions, data=data, simplify=simplify)
         if val_data is not None:
             _offspring.compute_fitness(
                 fitness_functions=fitness_functions, data=val_data, validation=True, simplify=False)
 
+        ## COMPUTE FEATURE PROBABILITY
+        if _offspring.bool_update_feature_probability:
+            _offspring.feature_probability=_offspring.update_feature_probability(data=data)
+
+        #print(f'Result: {_offspring.program}\n')#Feature prob. {_offspring.feature_probability}')
+
         # Reset the hash to force the re-computation
         _offspring._hash = None
 
-        return _offspring
+        return _offspring, successfull_brgflow, successfull_bootstrap
 
-    def _get_offspring_batch(self, data: Union[dict, pd.DataFrame, pd.Series], genetic_operators_frequency: Dict[str, float], fitness_functions: List[BaseFitness], population: Population, tournament_size: int, generation: int,
-                             batch_size: int, queue: Queue = None, val_data: Union[Dict, pd.Series, pd.DataFrame] = None) -> Program:
+    
+    def _generate_one_offspring(self,
+                                data: Union[dict, pd.DataFrame, pd.Series],
+                                genetic_operators_frequency: Dict[str, float],
+                                fitness_functions: List[BaseFitness],
+                                population: Population,
+                                tournament_size: int,
+                                generation: int,
+                                #batch_size: int,
+                                val_data: Union[Dict, pd.Series, pd.DataFrame] = None
+                                ) -> List[Program]:
+        """
+        Generate `batch_size * n_jobs` offspring in parallel using joblib.
+        - Continues generating until we have enough *valid* offspring
+        (those that don't have incomplete fitness).
+        - If `queue` is given, offspring go there (and we return an empty list).
+        Otherwise, we return a list of generated offspring.
 
+        CAUTION: This is "inner" parallelism. If your "outer" code also uses joblib,
+        you might want to reduce either the outer or inner n_jobs to avoid nested
+        oversubscription. 
+        """
+
+        # Optionally convert population to "program"
         try:
             population = population.as_program()
         except AttributeError:
-            population = population
+            pass
 
-        offsprings: List[Program] = list()
+        # If the status changed (user code might set self.status != "Generating Offsprings"), abort
+        if self.status != "Generating Offsprings":
+            return None
 
-        submitted = 0
-
-        jobs = self.n_jobs if self.n_jobs > 0 else os.cpu_count()
-
-        while submitted < batch_size * jobs:
-
-            if not self.status == "Generating Offsprings":
-                return
-
-            offspring = self._get_offspring(data=data, val_data=val_data,
-                                            genetic_operators_frequency=genetic_operators_frequency,
-                                            fitness_functions=fitness_functions, population=population,
-                                            tournament_size=tournament_size, generation=generation)
-
-            if offspring._has_incomplete_fitness:
-                continue
-
-            if queue is not None:
-                queue.put(offspring)
-            else:
-                offsprings.append(offspring)
-
-            submitted += 1
-
-        return offsprings
+        # Call your method that actually creates a single offspring
+        
+        offspring, successfull_brgflow, successfull_bootstrap = self._get_offspring(
+            data=data,
+            val_data=val_data,
+            genetic_operators_frequency=genetic_operators_frequency,
+            fitness_functions=fitness_functions,
+            population=population,
+            tournament_size=tournament_size,
+            generation=generation
+        )
+        # Skip "incomplete" offspring
+        if offspring._has_incomplete_fitness:
+            return None, 0, 0
+        return offspring, successfull_brgflow, successfull_bootstrap
+ 
 
     @property
     def metadata(self) -> Dict[str, Any]:
@@ -2247,21 +2358,17 @@ class SymbolicRegressor:
         pareto_front: List[Program] = self.extract_pareto_front(
             population=self.population, rank=rank_iter)
 
-        perc_prog = 0
+        
         while (len(survivors)+len(pareto_front) <= self.population_size) and pareto_front:
             survivors += pareto_front
             rank_iter += 1
             pareto_front = self.extract_pareto_front(
                 population=self.population, rank=rank_iter)
             
-            perc_prog = len(survivors)/self.population_size
-            if self.verbose > 1:
-                print(f"\tSelecting Final Population: composing the population {perc_prog:.1%}", end="\r")
+            
 
         if not pareto_front or (len(survivors) == self.population_size):
-            if self.verbose > 1:
-                print(f"\tSelecting Final Population: composing the population {perc_prog:.1%}. Completed!", end="\r")
-
+            
             return survivors
 
         else:
@@ -2269,15 +2376,13 @@ class SymbolicRegressor:
                 population=self.population, rank_iter=rank_iter)
 
             pareto_front.sort(
-                key=lambda p: p.crowding_distance, reverse=False)
+                key=lambda p: p.crowding_distance, reverse=True)
 
             survivors += pareto_front[:self.population_size-len(survivors)]
-            perc_prog = len(survivors)/self.population_size
-            if self.verbose > 1:
-                print(f"\tSelecting Final Population: composing the population {perc_prog:.1%}", end="\r")
+            
+           
 
-        if self.verbose > 1:
-            print(f"\tSelecting Final Population: composing the population {perc_prog:.1%}. Completed!", end="\n")
+        
 
         for rank in range(1, rank_iter + 1):
             if self.verbose > 1:
@@ -2289,52 +2394,6 @@ class SymbolicRegressor:
         if self.verbose > 1:
             print(f"\tSelecting Final Population: computing crowding distance {rank/(rank_iter):.1%}. Completed!", end="\n")
         
-        return survivors
-
-    def _select_final_population_NSGAII_iterative(self):
-        """
-        This method selects the final population that should propagate to the next generation.  
-        It selects based on rank until it risks saturating population size. Afterward, it recursively remove from the list
-        the worst elements of the reamining front based on secondary selection criteria. 
-
-        Args:
-            - None
-
-        Returns:
-            - survivors: List[Program]
-                The list of programs that will propagate to the next generation
-        """
-        survivors = []
-
-        rank_iter = 1
-        pareto_front: List[Program] = self.extract_pareto_front(
-            population=self.population, rank=rank_iter)
-
-        while (len(survivors)+len(pareto_front) <= self.population_size) and pareto_front:
-            survivors += pareto_front
-            rank_iter += 1
-            pareto_front = self.extract_pareto_front(
-                population=self.population, rank=rank_iter)
-
-        if not pareto_front or (len(survivors) == self.population_size):
-            return survivors
-
-        else:
-            while len(survivors) + len(pareto_front) > self.population_size:
-                self._crowding_distance(
-                    population=pareto_front, rank_iter=rank_iter)
-
-                pareto_front.sort(
-                    key=lambda p: p.crowding_distance, reverse=True)
-
-                pareto_front.pop(0)
-
-            survivors += pareto_front
-
-        for rank in range(1, rank_iter + 1):
-            self._crowding_distance(
-                population=survivors, rank_iter=rank)
-
         return survivors
 
     def _select_final_population_SMS_EMOEA(self):
@@ -2356,28 +2415,22 @@ class SymbolicRegressor:
         pareto_front: List[Program] = self.extract_pareto_front(
             population=self.population, rank=rank_iter)
 
-        perc_prog = 0
+        
         while (len(survivors)+len(pareto_front) <= self.population_size) and pareto_front:
             survivors += pareto_front
             rank_iter += 1
             pareto_front = self.extract_pareto_front(
                 population=self.population, rank=rank_iter)
             
-            perc_prog = len(survivors)/self.population_size
-            if self.verbose > 1:
-                print(f"\tSelecting Final Population: composing the population {perc_prog:.1%}", end="\r")
+            
+            
 
-        if not pareto_front or (len(survivors) == self.population_size):
-            if self.verbose > 1:
-                print(f"\tSelecting Final Population: composing the population {perc_prog:.1%}. Completed!", end="\r")
+        if not pareto_front or (len(survivors) == self.population_size):         
 
             return survivors
 
         else:
-            to_add = len(survivors)+len(pareto_front) - self.population_size
-            perc_to_fill = 1 - perc_prog
-            step = perc_to_fill/to_add
-
+            
             while len(survivors) + len(pareto_front) > self.population_size:
                 self._exclusive_hypervolume(
                     population=pareto_front, rank=rank_iter)
@@ -2386,18 +2439,14 @@ class SymbolicRegressor:
                     key=lambda p: p.exclusive_hypervolume, reverse=False)
 
                 pareto_front.pop(0)
-                perc_prog += step
-                if self.verbose > 1:
-                    print(f"\tSelecting Final Population: composing the population {perc_prog:.1%}", end="\r")
+                
 
             survivors += pareto_front
 
-            perc_prog = len(survivors)/self.population_size
-            if self.verbose > 1:
-                print(f"\tSelecting Final Population: composing the population {perc_prog:.1%}", end="\r")
+            
+            
 
-        if self.verbose > 1:
-            print(f"\tSelecting Final Population: composing the population {perc_prog:.1%}. Completed!", end="\n")
+        
 
         for rank in range(1, rank_iter + 1):
             if self.verbose > 1:
@@ -2519,12 +2568,10 @@ class SymbolicRegressor:
 
         return self.fpf_tree_diversity
 
-
 def compress(object):
     serialized_data = pickle.dumps(object)
     compressed_data = zlib.compress(serialized_data)
     return compressed_data
-
 
 def decompress(compressed_data):
     serialized_data = zlib.decompress(compressed_data)

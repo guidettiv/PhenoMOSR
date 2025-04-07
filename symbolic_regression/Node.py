@@ -105,7 +105,7 @@ class OperationNode(Node):
             This method recursively renders the program as a string
     """
 
-    def __init__(self, operation: callable, format_tf: str, format_diff: str, arity: int, symbol: str, format_str: str, father: Node) -> None:
+    def __init__(self, operation: callable, format_tf: str, format_diff: str, format_result: str, arity: int, symbol: str, format_str: str, father: Node) -> None:
         """ This method initializes the OperationNode
 
         Args:
@@ -131,6 +131,7 @@ class OperationNode(Node):
         self.arity = arity
         self.format_str = format_str
         self.format_tf = format_tf
+        self.format_result = format_result
         self.format_diff = format_diff if format_diff else format_str
 
         self.operands = []
@@ -370,7 +371,7 @@ class OperationNode(Node):
 
         return v
 
-    def render(self, data: Union[dict, pd.Series, pd.DataFrame, None] = None, format_tf: bool = False, format_diff: bool = False) -> str:
+    def render(self, data: Union[dict, pd.Series, pd.DataFrame, None] = None, format_tf: bool = False, format_diff: bool = False, format_result: bool = False) -> str:
         """ This method render the string of the program according to the formatting rules of its operations
 
         Args:
@@ -396,6 +397,12 @@ class OperationNode(Node):
         if format_diff:
             return self.format_diff.format(*[
                 node.render(data=data, format_diff=format_diff)
+                for node in self.operands
+            ])
+        
+        if format_result:
+            return self.format_result.format(*[
+                node.render(data=data, format_result=format_result)
                 for node in self.operands
             ])
 
@@ -674,7 +681,7 @@ class FeatureNode(Node):
         """
         return not pd.isna(self.feature)
 
-    def render(self, data: Union[dict, pd.Series, pd.DataFrame, None] = None, format_tf: bool = False, format_diff: bool = False) -> str:
+    def render(self, data: Union[dict, pd.Series, pd.DataFrame, None] = None, format_tf: bool = False, format_diff: bool = False, format_result: bool = False) -> str:
         """ This method render the string representation of this FeatureNode
 
         If data is provided, the rendering consist of the value of the datapoint of the feature of this
@@ -860,7 +867,7 @@ class InvalidNode(Node):
     def feature(self) -> float:
         return np.inf
 
-    def render(self, data: Union[dict, pd.Series, None] = None, format_tf: bool = False, format_diff: bool = False) -> str:
+    def render(self, data: Union[dict, pd.Series, None] = None, format_tf: bool = False, format_diff: bool = False, format_result: bool = False) -> str:
         """ This method render the string representation of this InvalidNode
 
         This is an InvalidNode, the end of a branch of a tree, so it returns 'InvalidNode'.

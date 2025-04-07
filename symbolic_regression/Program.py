@@ -1,7 +1,7 @@
 import copy
 import logging
 import random
-import signal
+#import signal
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
@@ -13,7 +13,7 @@ from pytexit import py2tex
 from symbolic_regression.multiobjective.fitness.Base import BaseFitness
 from symbolic_regression.multiobjective.hypervolume import _HyperVolume
 from symbolic_regression.multiobjective.optimization import (ADAM, ADAM2FOLD,
-                                                             SCIPY, SGD)
+                                                             SCIPY, SGD,GaussProcess)
 from symbolic_regression.Node import (FeatureNode, InvalidNode, Node,
                                       OperationNode)
 from symbolic_regression.operators import (OPERATOR_ADD, OPERATOR_MUL,
@@ -52,7 +52,16 @@ class Program:
 
     """
 
-    def __init__(self, operations: List[Dict], features: List[str], const_range: Tuple = (0, 1), program: Node = None, parsimony: float = .8, parsimony_decay: float = .85) -> None:
+    def __init__(self, 
+                 operations: List[Dict], 
+                 features: List[str], 
+                 feature_probability: List = [], 
+                 default_feature_probability: List = [], 
+                 bool_update_feature_probability: bool = False,
+                 const_range: Tuple = (0, 1), 
+                 program: Node = None, 
+                 parsimony: float = .8, 
+                 parsimony_decay: float = .85) -> None:
         """
 
 
@@ -91,6 +100,9 @@ class Program:
 
         self.operations: List[Dict] = operations
         self.features: List[str] = features
+        self.feature_probability: List = feature_probability
+        self.default_feature_probability: List = default_feature_probability
+        self.bool_update_feature_probability: bool = bool_update_feature_probability
         self.const_range: Tuple = const_range
         self._constants: List = list()
         self.converged: bool = False
@@ -116,6 +128,8 @@ class Program:
 
         self.is_logistic: bool = False
         self.is_affine: bool = False
+        self.already_brgflow: bool = False
+        self.already_bootstrapped: bool = False
 
         if program:
             self.program: Node = program
@@ -400,9 +414,11 @@ class Program:
                 import traceback
                 print(traceback.format_exc())
                 fitness_value = np.inf
+                self._override_is_valid = False
 
-            if pd.isna(fitness_value):
+            if pd.isna(fitness_value) or (fitness_value==np.inf): 
                 fitness_value = np.inf
+                self._override_is_valid = False
 
             if validation:
                 self.fitness_validation[ftn.label] = fitness_value
@@ -569,6 +585,7 @@ class Program:
                                  arity=operation_conf['arity'],
                                  format_str=operation_conf.get('format_str'),
                                  format_tf=operation_conf.get('format_tf'),
+                                 format_result=operation_conf.get('format_result'),
                                  symbol=operation_conf.get('symbol'),
                                  format_diff=operation_conf.get(
                                      'format_diff', operation_conf.get('format_str')),
@@ -620,11 +637,11 @@ class Program:
             selector_feature = random.random()
             # To prevent constant features to be underrepresented, we set a threshold
             threshold = max(.1, (1 / len(self.features)))
+            threshold = min(.3, threshold)
 
             if selector_feature > threshold and not force_constant:
                 # A Feature from the dataset
-
-                feature = random.choice(self.features)
+                feature = np.random.choice(self.features,p=np.array(self.feature_probability))
 
                 node = gen_feature(
                     feature=feature, father=father, is_constant=False)
@@ -788,9 +805,12 @@ class Program:
             father=None,
             parsimony=self.parsimony,
             parsimony_decay=self.parsimony_decay)
+        
+        #print(f'Tree generated: {self.program}')
+        self.to_affine_default(inplace=True)
 
         self.parsimony = self._parsimony_bkp  # Restore parsimony for future operations
-
+        
         logging.debug(f'Generated a program of depth {self.program_depth}')
         logging.debug(self.program)
 
@@ -811,17 +831,17 @@ class Program:
             - bool
                 True if the two programs are equivalent, False otherwise.
         """
-
-        if drop_by_similarity and self.similarity(other) > 0.99:
+        
+        if drop_by_similarity and self.similarity(other) > 0.99:  
             return True
-
-        for (a_label, a_fit), (b_label, b_fit) in zip(self.fitness.items(),
-                                                      other.fitness.items()):
+        a_fit_min = {f.label: self.fitness[f.label] for f in self.fitness_functions if f.minimize == True}
+        b_fit_min = {f.label: other.fitness[f.label] for f in other.fitness_functions if f.minimize == True}
+        for (_, a_fit), (_, b_fit) in zip(a_fit_min.items(),
+                                                      b_fit_min.items()):
 
             # One difference is enough for them not to be identical
             if abs(a_fit-b_fit) / abs(a_fit + 1e-8) > delta_fitness:
                 return False
-
         return True
 
     def is_constant(self):
@@ -896,34 +916,18 @@ class Program:
             - Program
                 The optimized program
         """
+        to_optimize = self if inplace else copy.deepcopy(self)
+
         if not constants_optimization or not self.is_valid:
-            return self
+            return to_optimize
 
         task = constants_optimization_conf['task']
         n_constants = len(self.get_constants(return_objects=False))
         n_features_used = len(self.features_used)
 
-        if n_constants > 40:
-            logging.debug(
-                'Program has more than 40 constants. Optimizing using ADAM')
-            constants_optimization = 'ADAM'
-            constants_optimization_conf = {
-                'task': task,
-                'learning_rate': 1e-4,
-                'batch_size': int(np.ceil(len(data)/10)),
-                'epochs': 200,
-                'verbose': 0,
-                'gradient_clip': False,
-                'beta_1': 0.9,
-                'beta_2': 0.999,
-                'epsilon': 1e-7,
-                'l1_param': 0,
-                'l2_param': 0,
-            }
-
-        if task not in ['regression:wmse', 'regression:wrrmse', 'regression:cox', 'binary:logistic']:
+        if task not in ['regression:wmse', 'regression:cox',  'regression:cox_efron', 'regression:finegray', 'binary:logistic', 'non-derivative:GP']:
             raise AttributeError(
-                f'Task supported are regression:wmse, regression:wrrmse, regression:cox or binary:logistic')
+                f'Task supported are regression:wmse/cox/cox-efron/finegray, binary:logistic or non-derivative:GP')
 
         if not isinstance(self.program, FeatureNode) and n_constants > 0 and n_features_used > 0:
             ''' Rationale for the conditions:
@@ -937,39 +941,34 @@ class Program:
             n_features_used > 0
                 as it is a constant program anyway and the optimized won't work with this configuration
             '''
+
             if constants_optimization == 'SGD':
                 f_opt = SGD
-                self.to_affine(data=data, target=target, inplace=True)
+                #self.to_affine(data=data, target=target, inplace=True)
 
             elif constants_optimization == 'ADAM':
                 f_opt = ADAM
-                self.to_affine(data=data, target=target, inplace=True)
+                #self.to_affine(data=data, target=target, inplace=True)
 
             elif constants_optimization == 'ADAM2FOLD':
                 # Here there can be more than one target so need the index
                 f_opt = ADAM2FOLD
-                self.to_affine(data=data, target=target[0], inplace=True)
+                #self.to_affine(data=data, target=target[0], inplace=True)
 
             elif constants_optimization == 'scipy':
                 f_opt = SCIPY
-                self.to_affine(data=data, target=target, inplace=True)
+                #self.to_affine(data=data, target=target, inplace=True)
+
+            elif constants_optimization == 'GaussianProcess':
+                assert task=='non-derivative:GP', 'Only IC strategy is implemented with GaussianProcess optimization'
+                f_opt = GaussProcess
+                to_optimize.simplify(inplace=True)
 
             else:
                 raise AttributeError(
                     f'Constants optimization method {constants_optimization} not supported')
 
-            to_optimize = self if inplace else copy.deepcopy(self)
-
-            def handler(signum, frame):
-                raise TimeoutError("Operation timed out")
-
-            class TimeoutError(Exception):
-                def __str__(self):
-                    return ""
-
-            signal.signal(signal.SIGALRM, handler)
-            signal.alarm(60)
-
+            
             try:
                 final_parameters, _, _ = f_opt(
                     program=to_optimize,
@@ -984,15 +983,13 @@ class Program:
                 return to_optimize
             except TimeoutError:
                 return to_optimize
-            finally:
-                signal.alarm(0)
-
+            
             if len(final_parameters) > 0:
                 to_optimize.set_constants(new=final_parameters)
 
             return to_optimize
 
-        return self
+        return to_optimize
 
     def _select_random_node(self, root_node: Union[OperationNode, FeatureNode, InvalidNode], depth: float = .8, only_operations: bool = False) -> Union[OperationNode, FeatureNode]:
         """ This method return a random node of a sub-tree starting from root_node.
@@ -1041,6 +1038,34 @@ class Program:
         for constant, new_value in zip(self.get_constants(return_objects=True), new):
             constant.feature = new_value
 
+    def update_feature_probability(self, data: Union[dict, pd.Series, pd.DataFrame])-> List[float]:   
+        find_config=False
+        for f in self.fitness_functions:
+            if (f.minimize==True) and (f.constants_optimization) and (f.constants_optimization_conf):
+                target=f.target
+                find_config=True
+
+        if not find_config:
+            return self.feature_probability
+        else:
+            try:
+                y_pred=self.evaluate(data=data)
+                y_true=data[target]
+                diff=y_true-y_pred
+
+                from sklearn.ensemble import RandomForestRegressor
+                regr = RandomForestRegressor(max_depth=4, random_state=42)
+                regr.fit(data[self.features], diff)
+                scores=regr.feature_importances_
+                scores=scores/np.sum(scores)
+                scores = np.round(scores, decimals=4).astype(np.float64)
+                id_max=np.argmax(scores)
+                max_val=scores[id_max]
+                scores[id_max]=1-(scores.sum()-max_val)
+                return scores.tolist()
+            except ValueError:
+                return self.feature_probability
+    
     @staticmethod
     def _set_constants_index(constant, index) -> None:
         """ This method allow to overwrite the index of a constant
@@ -1097,8 +1122,56 @@ class Program:
         """
         from symbolic_regression.simplification import extract_operation
 
-        if self._hash:
-            return self
+        def find_division_nodes(node):
+            """
+            Recursively traverses the tree starting at 'node' and collects 
+            all OperationNode instances whose symbol is '/'.
+            
+            Returns:
+                A list of matching nodes.
+            """
+            from symbolic_regression.Node import OperationNode,FeatureNode
+            division_nodes = []
+            
+            if isinstance(node, OperationNode):
+                if node.symbol == "/":
+                    division_nodes.append(node)
+                # Traverse each operand (child) recursively
+                for child in node.operands:
+                    division_nodes.extend(find_division_nodes(child))
+            # If it's a FeatureNode, we don't do anything (it has no children to traverse)
+            
+            return division_nodes
+
+        def clean_one_division(program, mutate_point):
+            mutate_point_father=mutate_point.father
+            mutate_point_grandfather=mutate_point_father.father
+            
+            if (mutate_point.operands[0].feature==1.0) and (mutate_point.father.symbol == '*'):
+                #replace 1 with feature appearing as the first argument of the product (father) and connect edges
+                index_mutate_point=mutate_point_father.operands.index(mutate_point)
+                mutate_point.operands[0]=mutate_point_father.operands[1-index_mutate_point]
+                mutate_point_father.operands[1-index_mutate_point].father=mutate_point
+                #link division a layer above
+                if mutate_point_grandfather:
+                    #find right index to glue the grandfather node and the division node.
+                    right_index=mutate_point_grandfather.operands.index(mutate_point.father)
+                    mutate_point_grandfather.operands[right_index]=mutate_point
+                    mutate_point.father=mutate_point_grandfather
+                    return program
+                else: 
+                    mutate_point.father=mutate_point_grandfather
+                    return mutate_point
+            else:
+                return program
+
+        def clean_division(program):
+            import copy
+            new_program=copy.deepcopy(program)
+            mutate_point_list=find_division_nodes(new_program)[::-1]
+            for mutate_point in mutate_point_list:
+                new_program=clean_one_division(new_program, mutate_point)  
+            return new_program
 
         def simplify_program(program: Union[Program, str]) -> Union[FeatureNode, OperationNode, InvalidNode]:
             """ This function simplify a program using a SymPy backend
@@ -1126,6 +1199,8 @@ class Program:
 
                 new_program = extract_operation(element_to_extract=simplified,
                                                 father=None)
+                new_program = clean_division(new_program)
+                
 
                 logging.debug(f'Simplified program {new_program}')
 
@@ -1134,6 +1209,9 @@ class Program:
             except UnboundLocalError:
                 return program.program
 
+        if self._hash:
+            return self
+        
         if inplace:
             to_return = self
         else:
@@ -1212,6 +1290,7 @@ class Program:
             arity=OPERATOR_ADD['arity'],
             format_str=OPERATOR_ADD['format_str'],
             format_tf=OPERATOR_ADD.get('format_tf'),
+            format_result=OPERATOR_ADD.get('format_result'),
             symbol=OPERATOR_ADD.get('symbol'),
             format_diff=OPERATOR_ADD.get(
                 'format_diff', OPERATOR_ADD['format_str']),
@@ -1225,6 +1304,75 @@ class Program:
             arity=OPERATOR_MUL['arity'],
             format_str=OPERATOR_MUL['format_str'],
             format_tf=OPERATOR_MUL.get('format_tf'),
+            format_result=OPERATOR_MUL.get('format_result'),
+            symbol=OPERATOR_MUL.get('symbol'),
+            format_diff=OPERATOR_MUL.get(
+                'format_diff', OPERATOR_MUL['format_str']),
+            father=add_node
+        )
+
+        mul_node.add_operand(FeatureNode(
+            feature=beta, father=mul_node, is_constant=True))
+
+        prog.program.father = mul_node
+        mul_node.add_operand(prog.program)
+        add_node.add_operand(mul_node)
+
+        prog.program = add_node
+        prog.is_affine = True
+
+        # Reset the hash to force the re-computation
+        self._hash = None
+        return prog
+    
+    def to_affine_default(self, inplace: bool = False) -> 'Program':
+        """ 
+        Args:
+
+            - inplace: bool (default=False)
+                If True, the program is simplified in place. If False, a new Program object is returned.
+
+        Returns:
+            - Program
+                The affine program
+        """
+
+        if not self.is_valid:
+            return self
+
+        if inplace:
+            prog = self
+        else:
+            prog = copy.deepcopy(self)
+
+        
+
+        alpha = 1e-3
+        beta = 1+1e-4
+
+        if pd.isna(alpha) or pd.isna(beta):
+            return prog
+
+        add_node = OperationNode(
+            operation=OPERATOR_ADD['func'],
+            arity=OPERATOR_ADD['arity'],
+            format_str=OPERATOR_ADD['format_str'],
+            format_tf=OPERATOR_ADD.get('format_tf'),
+            format_result=OPERATOR_ADD.get('format_result'),
+            symbol=OPERATOR_ADD.get('symbol'),
+            format_diff=OPERATOR_ADD.get(
+                'format_diff', OPERATOR_ADD['format_str']),
+            father=None
+        )
+        add_node.add_operand(FeatureNode(
+            feature=alpha, father=add_node, is_constant=True))
+
+        mul_node = OperationNode(
+            operation=OPERATOR_MUL['func'],
+            arity=OPERATOR_MUL['arity'],
+            format_str=OPERATOR_MUL['format_str'],
+            format_tf=OPERATOR_MUL.get('format_tf'),
+            format_result=OPERATOR_MUL.get('format_result'),
             symbol=OPERATOR_MUL.get('symbol'),
             format_diff=OPERATOR_MUL.get(
                 'format_diff', OPERATOR_MUL['format_str']),
@@ -1264,6 +1412,7 @@ class Program:
             arity=OPERATOR_SIGMOID['arity'],
             format_str=OPERATOR_SIGMOID['format_str'],
             format_tf=OPERATOR_SIGMOID.get('format_tf'),
+            format_result=OPERATOR_SIGMOID.get('format_result'),
             symbol=OPERATOR_SIGMOID.get('symbol'),
             format_diff=OPERATOR_SIGMOID.get(
                 'format_diff', OPERATOR_SIGMOID['format_str']),
@@ -1330,11 +1479,15 @@ class Program:
         if not other:
             other = Program(operations=self.operations,
                             features=self.features,
+                            feature_probability=self.default_feature_probability,
+                            default_feature_probability=self.default_feature_probability,
+                            bool_update_feature_probability=self.bool_update_feature_probability,
                             const_range=self.const_range,
                             program=self.program,
                             parsimony=self.parsimony,
                             parsimony_decay=self.parsimony_decay)
             other.init_program()
+
 
         if not isinstance(other, Program):
             raise TypeError(
@@ -1357,7 +1510,22 @@ class Program:
             self._select_random_node(root_node=other.program))
 
         if not cross_over_point1 or not cross_over_point2:
-            return self
+            new = Program(operations=self.operations,
+                                features=self.features,
+                                feature_probability=self.default_feature_probability,
+                                default_feature_probability=self.default_feature_probability,
+                                bool_update_feature_probability=self.bool_update_feature_probability,
+                                const_range=self.const_range,
+                                parsimony=self.parsimony,
+                                parsimony_decay=self.parsimony_decay)
+            new.init_program()
+            if inplace:
+                self.program = new
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
+                return self
+            return new
 
         cross_over_point2.father = cross_over_point1.father
 
@@ -1370,11 +1538,17 @@ class Program:
 
         if inplace:
             self.program = offspring
+            self._hash = None
+            self.already_bootstrapped = False
+            self.already_brgflow = False
             return self
 
         new = Program(program=offspring,
                       operations=self.operations,
                       features=self.features,
+                      feature_probability=self.feature_probability,
+                      default_feature_probability=self.default_feature_probability,
+                      bool_update_feature_probability=self.bool_update_feature_probability,
                       const_range=self.const_range,
                       parsimony=self.parsimony,
                       parsimony_decay=self.parsimony_decay)
@@ -1401,6 +1575,9 @@ class Program:
             # A new tree is generated.
             new = Program(operations=self.operations,
                           features=self.features,
+                          feature_probability=self.default_feature_probability,
+                          default_feature_probability=self.default_feature_probability,
+                          bool_update_feature_probability=self.bool_update_feature_probability,
                           const_range=self.const_range,
                           parsimony=self.parsimony,
                           parsimony_decay=self.parsimony_decay)
@@ -1409,6 +1586,9 @@ class Program:
 
             if inplace:
                 self.program = new
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
                 return self
 
             return new
@@ -1420,6 +1600,9 @@ class Program:
         if (not mutate_point) or not (mutate_point.father):
             new = Program(operations=self.operations,
                           features=self.features,
+                          feature_probability=self.default_feature_probability,
+                          default_feature_probability=self.default_feature_probability,
+                          bool_update_feature_probability=self.bool_update_feature_probability,
                           const_range=self.const_range,
                           parsimony=self.parsimony,
                           parsimony_decay=self.parsimony_decay)
@@ -1428,23 +1611,33 @@ class Program:
 
             if inplace:
                 self.program = new
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
                 return self
 
             return new
 
-        mutated = self._generate_tree(
-            father=mutate_point.father, parsimony=self.parsimony, parsimony_decay=self.parsimony_decay)
+        mutated = self._generate_tree(father=mutate_point.father, 
+                                      parsimony=self.parsimony, 
+                                      parsimony_decay=self.parsimony_decay)
 
         mutate_point.father.operands[
             mutate_point.father.operands.index(mutate_point)] = mutated
 
         if inplace:
             self.program = offspring
+            self._hash = None
+            self.already_bootstrapped = False
+            self.already_brgflow = False
             return self
 
         new = Program(program=offspring,
                       operations=self.operations,
                       features=self.features,
+                      feature_probability=self.feature_probability,
+                      default_feature_probability=self.default_feature_probability,
+                      bool_update_feature_probability=self.bool_update_feature_probability,
                       const_range=self.const_range,
                       parsimony=self.parsimony,
                       parsimony_decay=self.parsimony_decay)
@@ -1471,6 +1664,9 @@ class Program:
         if not mutate_point:
             new = Program(operations=self.operations,
                           features=self.features,
+                          feature_probability=self.default_feature_probability,
+                          default_feature_probability=self.default_feature_probability,
+                          bool_update_feature_probability=self.bool_update_feature_probability,
                           const_range=self.const_range,
                           parsimony=self.parsimony,
                           parsimony_decay=self.parsimony_decay)
@@ -1479,6 +1675,9 @@ class Program:
 
             if inplace:
                 self.program = new
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
                 return self
 
             return new
@@ -1503,11 +1702,17 @@ class Program:
 
         if inplace:
             self.program = offspring
+            self._hash = None
+            self.already_bootstrapped = False
+            self.already_brgflow = False
             return self
 
         new = Program(program=offspring,
                       operations=self.operations,
                       features=self.features,
+                      feature_probability=self.feature_probability,
+                      default_feature_probability=self.default_feature_probability,
+                      bool_update_feature_probability=self.bool_update_feature_probability,
                       const_range=self.const_range,
                       parsimony=self.parsimony,
                       parsimony_decay=self.parsimony_decay)
@@ -1535,7 +1740,22 @@ class Program:
         if mutate_point:
             mutate_father = mutate_point.father
         else:  # When the mutate point is None, can happen when program is only a FeatureNode
-            return self
+            new = Program(operations=self.operations,
+                        features=self.features,
+                        feature_probability=self.default_feature_probability,
+                        default_feature_probability=self.default_feature_probability,
+                        bool_update_feature_probability=self.bool_update_feature_probability,
+                        const_range=self.const_range,
+                        parsimony=self.parsimony,
+                        parsimony_decay=self.parsimony_decay)
+            new.init_program()
+            if inplace:
+                self.program = new
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
+                return self
+            return new
 
         mutate_child = random.choice(mutate_point.operands)
         mutate_child.father = mutate_father
@@ -1548,11 +1768,17 @@ class Program:
 
         if inplace:
             self.program = offspring
+            self._hash = None
+            self.already_bootstrapped = False
+            self.already_brgflow = False
             return self
 
         new = Program(program=offspring,
                       operations=self.operations,
                       features=self.features,
+                      feature_probability=self.feature_probability,
+                      default_feature_probability=self.default_feature_probability,
+                      bool_update_feature_probability=self.bool_update_feature_probability,
                       const_range=self.const_range,
                       parsimony=self.parsimony,
                       parsimony_decay=self.parsimony_decay)
@@ -1591,7 +1817,14 @@ class Program:
 
         if inplace:
             self.program = offspring.program
+            self._hash = None
+            self.already_bootstrapped = False
+            self.already_brgflow = False
             return self
+
+        offspring._hash = None
+        offspring.already_bootstrapped = False
+        offspring.already_brgflow = False
 
         return offspring
 
@@ -1616,6 +1849,9 @@ class Program:
         if not mutate_point:  # Only a FeatureNode without any OperationNode
             new = Program(operations=self.operations,
                           features=self.features,
+                          feature_probability=self.default_feature_probability,
+                          default_feature_probability=self.default_feature_probability,
+                          bool_update_feature_probability=self.bool_update_feature_probability,
                           const_range=self.const_range,
                           parsimony=self.parsimony,
                           parsimony_decay=self.parsimony_decay)
@@ -1624,28 +1860,37 @@ class Program:
 
             if inplace:
                 self.program = new
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
                 return self
-
             return new
 
         new_operation = random.choice(self.operations)
-        while new_operation['arity'] != mutate_point.arity:
+        while new_operation['arity'] != mutate_point.arity or (mutate_point.symbol==new_operation.get('symbol')):
             new_operation = random.choice(self.operations)
 
         mutate_point.operation = new_operation.get('func')
         mutate_point.format_str = new_operation.get('format_str')
         mutate_point.format_tf = new_operation.get('format_tf')
+        mutate_point.format_result = new_operation.get('format_result'),
         mutate_point.symbol = new_operation.get('symbol')
         mutate_point.format_diff = new_operation.get(
             'format_diff', new_operation.get('format_str'))
 
         if inplace:
             self.program = offspring
+            self._hash = None
+            self.already_bootstrapped = False
+            self.already_brgflow = False
             return self
 
         new = Program(program=offspring,
                       operations=self.operations,
                       features=self.features,
+                      feature_probability=self.feature_probability,
+                      default_feature_probability=self.default_feature_probability,
+                      bool_update_feature_probability=self.bool_update_feature_probability,
                       const_range=self.const_range,
                       parsimony=self.parsimony,
                       parsimony_decay=self.parsimony_decay)
@@ -1677,13 +1922,709 @@ class Program:
 
         if inplace:
             self.program = offspring.program
+            self.already_bootstrapped = False
+            self.already_brgflow = False
             return self
 
         new = Program(program=offspring.program,
                       operations=self.operations,
                       features=self.features,
+                      feature_probability=self.feature_probability,
+                      default_feature_probability=self.default_feature_probability,
+                      bool_update_feature_probability=self.bool_update_feature_probability,
                       const_range=self.const_range,
                       parsimony=self.parsimony,
                       parsimony_decay=self.parsimony_decay)
 
         return new
+
+    def additive_expansion(self, inplace: bool = False) -> 'Program':
+        """ This method perform a mutation on a random node of the current program
+
+        An expansion presumes to include a new additive term in a formula containing
+        a new random subtree 
+
+        Args:
+            - inplace: bool (default=False)
+                If True, expand is performed in place. If False, a new Program object is returned.
+
+        Returns:
+            - Program
+                The new program after the mutation is applied
+        """
+
+        def find_operation_nodes(node,symbol='+'):
+            """
+            Recursively traverses the tree starting at 'node' and collects 
+            all OperationNode instances whose symbol is '/'.
+            
+            Returns:
+                A list of matching nodes.
+            """
+            from symbolic_regression.Node import OperationNode
+            operation_nodes = []
+            
+            if isinstance(node, OperationNode):
+                if node.symbol == symbol:
+                    operation_nodes.append(node)
+                # Traverse each operand (child) recursively
+                for child in node.operands:
+                    operation_nodes.extend(find_operation_nodes(child))
+            # If it's a FeatureNode, we don't do anything (it has no children to traverse)
+            return operation_nodes
+
+
+        offspring = copy.deepcopy(self)
+        plus_nodes=find_operation_nodes(offspring.program,symbol='+')
+
+        if (not plus_nodes):
+            new = Program(operations=self.operations,
+                        features=self.features,
+                        feature_probability=self.default_feature_probability,
+                        default_feature_probability=self.default_feature_probability,
+                        bool_update_feature_probability=self.bool_update_feature_probability,
+                        const_range=self.const_range,
+                        parsimony=self.parsimony,
+                        parsimony_decay=self.parsimony_decay)
+
+            new.init_program()
+            if inplace:
+                self.program = new
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
+                return self
+
+            return new
+
+        plus_node = np.random.choice(plus_nodes)
+
+        add_operation = OperationNode(
+                        operation=OPERATOR_ADD['func'],
+                        arity=OPERATOR_ADD['arity'],
+                        format_str=OPERATOR_ADD['format_str'],
+                        format_tf=OPERATOR_ADD['format_tf'],
+                        format_result=OPERATOR_ADD.get('format_result'),
+                        symbol=OPERATOR_ADD['symbol'],
+                        format_diff=OPERATOR_ADD.get(
+                            'format_diff', OPERATOR_ADD['format_str']),
+                        father=plus_node.father
+                    )
+        
+        
+        if plus_node.father is not None: 
+            new_program=offspring.program
+            index=plus_node.father.operands.index(plus_node)
+            plus_node.father.operands[index]=add_operation
+        else:
+            new_program=add_operation
+
+        plus_node.father = add_operation
+        add_operation.operands.append(plus_node)
+
+        ### QUA RICALCOLA FEATURE PROBABILITY
+        new_addendum = self._generate_tree(father=add_operation, 
+                                            parsimony=self.parsimony, 
+                                            parsimony_decay=self.parsimony_decay)
+        add_operation.operands.append(new_addendum)
+
+        if inplace:
+            self.program = new_program
+            self._hash = None
+            self.already_bootstrapped = False
+            self.already_brgflow = False
+            return self
+
+        new = Program(program=new_program,
+                        operations=self.operations,
+                        features=self.features,
+                        feature_probability=self.feature_probability,
+                        default_feature_probability=self.default_feature_probability,
+                        bool_update_feature_probability=self.bool_update_feature_probability,
+                        const_range=self.const_range,
+                        parsimony=self.parsimony,
+                        parsimony_decay=self.parsimony_decay)
+
+        return new
+    
+    def regularize_brgflow(self, 
+                            data,
+                            knee=False, 
+                            threshold=0.01,
+                            inplace: bool = False) -> 'Program':
+        """ This method perform a regularization of the tree aimed to streamline the tree structure and remove redundancies
+
+        This mutation relies on the BRG Flow approach or on the bootstrap approach. 
+
+        Args:
+            - BRGFlow=True use brgflow approach
+            - bootstrap=True use bootstrap approach
+            - k number of bootstrap iterations
+            - frac = dataset fraction used in bootstrapping coefficients
+            - knee = use the knee method in brgflow to identify optimal cutting point
+            - threshold = a priori threshold for brgflow regularization
+            - inplace: bool (default=False)
+                If True, the mutation is performed in place. If False, a new Program object is returned.
+
+        Returns:
+            - Program
+                The new program after the mutation is applied
+        """
+        import copy
+        import sympy as sym
+        from symbolic_regression.Program import Program
+        from symbolic_regression.simplification import extract_operation
+        from sympy import lambdify
+
+        def DiracDeltaV(x):
+            return np.where(np.abs(x) < 1e-7, 1e7, 0)
+
+        def find_division_nodes(node):
+            """
+            Recursively traverses the tree starting at 'node' and collects 
+            all OperationNode instances whose symbol is '/'.
+            
+            Returns:
+                A list of matching nodes.
+            """
+            from symbolic_regression.Node import OperationNode
+            division_nodes = []
+            
+            if isinstance(node, OperationNode):
+                if node.symbol == "/":
+                    division_nodes.append(node)
+                # Traverse each operand (child) recursively
+                for child in node.operands:
+                    division_nodes.extend(find_division_nodes(child))
+            # If it's a FeatureNode, we don't do anything (it has no children to traverse)
+            
+            return division_nodes
+
+        def clean_division(program):
+            import copy
+            new_program=copy.deepcopy(program)
+            mutate_point_list=find_division_nodes(new_program)[::-1]
+            for mutate_point in mutate_point_list:
+                new_program=clean_one_division(new_program, mutate_point)  
+            return new_program
+
+        def clean_one_division(program, mutate_point):
+            mutate_point_father=mutate_point.father
+            mutate_point_grandfather=mutate_point_father.father
+            
+            if (mutate_point.operands[0].feature==1.0) and (mutate_point.father.symbol == '*'):
+                #replace 1 with feature appearing as the first argument of the product (father) and connect edges
+                index_mutate_point=mutate_point_father.operands.index(mutate_point)
+                mutate_point.operands[0]=mutate_point_father.operands[1-index_mutate_point]
+                mutate_point_father.operands[1-index_mutate_point].father=mutate_point
+                #link division a layer above
+                if mutate_point_grandfather:
+                    #find right index to glue the grandfather node and the division node.
+                    right_index=mutate_point_grandfather.operands.index(mutate_point.father)
+                    mutate_point_grandfather.operands[right_index]=mutate_point
+                    mutate_point.father=mutate_point_grandfather
+                    return program
+                else: 
+                    mutate_point.father=mutate_point_grandfather
+                    return mutate_point
+            else:
+                return program
+            
+        def find_knee_value_orthogonal(array):
+            # 1) Sort the array
+            sorted_array = np.sort(array)
+            n = len(sorted_array)
+            
+            # If there's only one point or two points, the concept of a "knee" might not be meaningful;
+            # we'll just handle the trivial cases directly:
+            if n < 3:
+                return sorted_array[0]
+            
+            # 2) Define the x-coordinates as the indices (0 to n-1)
+            x = np.arange(n)
+            
+            # 3) The line goes from (x1, y1) = (0, sorted_array[0]) to (x2, y2) = (n-1, sorted_array[-1])
+            O = np.array([0, sorted_array[0]])
+            Op = np.array([n - 1, sorted_array[-1]])
+            OOp=Op-O
+
+            # 4) Compute distances for each i
+            distances = []
+            for i in range(n):
+                OA = np.array([x[i], sorted_array[i]]) - O
+                OR= np.matmul(OOp,OA)/np.linalg.norm(OOp)
+                distance = np.sqrt(np.abs(np.matmul(OA,OA)-OR**2))
+                distances.append(distance)
+            
+            distances = np.array(distances)
+            
+            # 5) The knee index is where the orthogonal distance is maximum
+            knee_index = np.argmax(distances)
+            
+            # Return the corresponding (sorted) value
+            return sorted_array[knee_index]
+        
+        succesfull=0
+        constants = np.array([item.feature for item in self.get_constants(return_objects=True)])
+        n_constants=len(constants)
+        n_features = len(self.features)
+
+        if (n_constants<=2) or (self.program_depth  == 0) or (len(self.features_used)<1) or (self.already_brgflow):
+            #if (self.already_brgflow):
+            #    print('Already BRGFLOW')
+            #elif (self.program_depth  == 0):
+            #    print('no depth')
+            #elif (len(self.features_used)<1):
+            #    print('no features')
+            #elif (n_constants<=2):
+            #    print('less than 2 constants')
+            #Case in which a 
+            # 1) FeatureNode program is passed,
+            # 2) the program does not have more than 2 constants,
+            # A new tree is generated.
+            new = Program(operations=self.operations,
+                          features=self.features,
+                          feature_probability=self.default_feature_probability,
+                          default_feature_probability=self.default_feature_probability,
+                          bool_update_feature_probability=self.bool_update_feature_probability,
+                          const_range=self.const_range,
+                          parsimony=self.parsimony,
+                          parsimony_decay=self.parsimony_decay)
+            new.init_program()
+            try:
+                new.simplify(inplace=True)
+            except ValueError:
+                #print('error in simplfy new prog')
+                new._override_is_valid = False
+            if inplace:
+                self.program = new
+                self.override_is_valid = new._override_is_valid
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
+                return self
+            return new, succesfull
+        offspring = copy.deepcopy(self)
+        
+        x_sym = ''
+        for f in offspring.features:
+            x_sym += f'{f},'
+        x_sym = sym.symbols(x_sym)
+        c_sym = sym.symbols('c0:{}'.format(n_constants))
+        p_sym = offspring.program.render(format_diff=True)
+
+        split_c = np.split(
+                constants *np.ones((data.shape[0],1)), n_constants, 1)
+        split_X = np.split(
+            data[offspring.features].to_numpy(), n_features, 1)
+
+        ##compute FIM
+        log_expr = sym.parse_expr('log('+p_sym+')')
+        FIM_avg = []
+        try:
+            for ci in c_sym:
+                row=[]
+                for cj in c_sym:
+                    entry=sym.diff(log_expr, ci).doit()*sym.diff(log_expr, cj).doit()
+                    f_entry=lambdify([x_sym, c_sym], 
+                                    entry, 
+                                    modules=['numpy', {'DiracDelta': DiracDeltaV, 'Sqrt': np.sqrt}])
+                    avg_entry=np.mean(f_entry(tuple(split_X), tuple(split_c)))
+                    row.append(float(avg_entry))
+                FIM_avg.append(row)
+            FIM_avg=np.array(FIM_avg)
+        except NameError:
+            print('name error brutto: new prog')
+            #print(x_sym, c_sym)
+            #print(entry)
+
+
+
+            ## generate a new program
+            new = Program(operations=self.operations,
+                            features=self.features,
+                            feature_probability=self.default_feature_probability,
+                            default_feature_probability=self.default_feature_probability,
+                            bool_update_feature_probability=self.bool_update_feature_probability,
+                            const_range=self.const_range,
+                            parsimony=self.parsimony,
+                            parsimony_decay=self.parsimony_decay)
+            new.init_program()
+            try:
+                new.simplify(inplace=True)
+            except ValueError:
+                #print('error in simplfy new prog')
+                new._override_is_valid = False
+            if inplace:
+                self.program = new
+                self.override_is_valid = new._override_is_valid
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
+                return self
+            return new, succesfull
+        
+        if knee:
+            threshold_knee = find_knee_value_orthogonal(np.diag(FIM_avg))
+            threshold=np.min([threshold_knee,threshold])
+
+        mask=np.diag(FIM_avg)<=threshold 
+        sum_masked=np.sum(mask)
+        constants[mask]=0.
+
+        if sum_masked>0:
+            try:
+                offspring.set_constants(new=constants)
+                
+                simplifed_string = sym.simplify(offspring.program)
+            
+                new_program = extract_operation(element_to_extract=simplifed_string,
+                                                                    father=None)
+                new_program = clean_division(new_program)
+
+                offspring.program=new_program
+                #print('!!!!!BRGFLOW SUCCESSFULLY APPLIED!!!!')
+                succesfull=1
+                if inplace:
+                    self.program = new_program
+                    self._hash = None
+                    self.already_brgflow = True
+                    return self
+                else:
+                    offspring.program=new_program
+                    offspring.already_brgflow = True
+                    offspring._hash = None
+                    return offspring, succesfull
+
+            except ValueError:
+                #print('error in brgpart')
+                ## generate a new program
+                new = Program(operations=self.operations,
+                                features=self.features,
+                                feature_probability=self.default_feature_probability,
+                                default_feature_probability=self.default_feature_probability,
+                                bool_update_feature_probability=self.bool_update_feature_probability,
+                                const_range=self.const_range,
+                                parsimony=self.parsimony,
+                                parsimony_decay=self.parsimony_decay)
+                new.init_program()
+                try:
+                    new.simplify(inplace=True)
+                except ValueError:
+                    #print('error in simplfy new prog')
+                    new._override_is_valid = False
+                if inplace:
+                    self.program = new
+                    self.override_is_valid = new._override_is_valid
+                    self._hash = None
+                    self.already_bootstrapped = False
+                    self.already_brgflow = False
+                    return self
+                return new, succesfull
+        else:
+            #print(f'no constants to mask: {np.diag(FIM_avg)}')
+            ## generate a new program
+            new = Program(operations=self.operations,
+                            features=self.features,
+                            feature_probability=self.default_feature_probability,
+                            default_feature_probability=self.default_feature_probability,
+                            bool_update_feature_probability=self.bool_update_feature_probability,
+                            const_range=self.const_range,
+                            parsimony=self.parsimony,
+                            parsimony_decay=self.parsimony_decay)
+            new.init_program()
+            try:
+                new.simplify(inplace=True)
+            except ValueError:
+                #print('error in simplfy new prog')
+                new._override_is_valid = False
+            if inplace:
+                self.program = new
+                self.override_is_valid = new._override_is_valid
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
+                return self
+            return new, succesfull
+            
+    def regularize_bootstrap(self, 
+                            data,
+                            k=150,
+                            frac=0.7,
+                            n_jobs=3,
+                            inplace: bool = False) -> 'Program':
+        """ This method perform a regularization of the tree aimed to streamline the tree structure and remove redundancies
+
+        This mutation relies on the BRG Flow approach or on the bootstrap approach. 
+
+        Args:
+            - BRGFlow=True use brgflow approach
+            - bootstrap=True use bootstrap approach
+            - k number of bootstrap iterations
+            - frac = dataset fraction used in bootstrapping coefficients
+            - knee = use the knee method in brgflow to identify optimal cutting point
+            - threshold = a priori threshold for brgflow regularization
+            - inplace: bool (default=False)
+                If True, the mutation is performed in place. If False, a new Program object is returned.
+
+        Returns:
+            - Program
+                The new program after the mutation is applied
+        """
+        import copy
+        import sympy as sym
+        from symbolic_regression.Program import Program
+        
+        def find_division_nodes(node):
+            """
+            Recursively traverses the tree starting at 'node' and collects 
+            all OperationNode instances whose symbol is '/'.
+            
+            Returns:
+                A list of matching nodes.
+            """
+            from symbolic_regression.Node import OperationNode
+            division_nodes = []
+            
+            if isinstance(node, OperationNode):
+                if node.symbol == "/":
+                    division_nodes.append(node)
+                # Traverse each operand (child) recursively
+                for child in node.operands:
+                    division_nodes.extend(find_division_nodes(child))
+            # If it's a FeatureNode, we don't do anything (it has no children to traverse)
+            
+            return division_nodes
+
+        def clean_division(program):
+            import copy
+            new_program=copy.deepcopy(program)
+            mutate_point_list=find_division_nodes(new_program)[::-1]
+            for mutate_point in mutate_point_list:
+                new_program=clean_one_division(new_program, mutate_point)  
+            return new_program
+
+        def clean_one_division(program, mutate_point):
+            mutate_point_father=mutate_point.father
+            mutate_point_grandfather=mutate_point_father.father
+            
+            if (mutate_point.operands[0].feature==1.0) and (mutate_point.father.symbol == '*'):
+                #replace 1 with feature appearing as the first argument of the product (father) and connect edges
+                index_mutate_point=mutate_point_father.operands.index(mutate_point)
+                mutate_point.operands[0]=mutate_point_father.operands[1-index_mutate_point]
+                mutate_point_father.operands[1-index_mutate_point].father=mutate_point
+                #link division a layer above
+                if mutate_point_grandfather:
+                    #find right index to glue the grandfather node and the division node.
+                    right_index=mutate_point_grandfather.operands.index(mutate_point.father)
+                    mutate_point_grandfather.operands[right_index]=mutate_point
+                    mutate_point.father=mutate_point_grandfather
+                    return program
+                else: 
+                    mutate_point.father=mutate_point_grandfather
+                    return mutate_point
+            else:
+                return program
+            
+        def single_bootstrap(program,
+                            data,
+                            target,
+                            weights,
+                            constants_optimization,
+                            constants_optimization_conf,
+                            frac=0.6,
+                            low=-1,
+                            high=1):
+            
+            import copy
+            bs_data = data.sample(frac=frac, replace=False)
+            bs_data[weights]=1.
+            recalibrated = copy.deepcopy(program)
+            recalibrated.set_constants(new=list(np.random.uniform(low=low,
+                                                        high=high,
+                                                        size=len(program.get_constants())
+                                                            ))
+                                        )
+            optimized=recalibrated.optimize(
+                        data=bs_data,
+                        target=target,
+                        weights=weights,
+                        constants_optimization=constants_optimization,
+                        constants_optimization_conf=constants_optimization_conf,
+                        inplace=False
+                    )
+            return optimized.get_constants(return_objects=False)
+
+        def Bootstrapping_constants(program,
+                                    data,
+                                    target,
+                                    weights,
+                                    constants_optimization,
+                                    constants_optimization_conf,
+                                    k=1000,
+                                    frac=0.6,
+                                    n_jobs=3):
+            from joblib import Parallel, delayed
+            import copy
+            from typing import List
+
+            n_constants = len(program.get_constants(return_objects=False))
+            n_features_used = len(program.features_used)
+            if not (n_constants > 0 and n_features_used > 0):
+                return None
+            
+
+            bootstrapped_constants: List[float] = Parallel(n_jobs=n_jobs)(delayed(single_bootstrap)(program=program,
+                                                                                                data=data,
+                                                                                                target=target,
+                                                                                                weights=weights,
+                                                                                                constants_optimization=constants_optimization,
+                                                                                                constants_optimization_conf=constants_optimization_conf,
+                                                                                                frac=frac) for _ in range(k))
+            
+            return np.array(bootstrapped_constants)
+        
+        succesfull=0
+        constants = np.array([item.feature for item in self.get_constants(return_objects=True)])
+        n_constants=len(constants)
+
+        find_config=False
+        for f in self.fitness_functions:
+            if (f.minimize==True) and (f.constants_optimization) and (f.constants_optimization_conf):
+                constants_optimization=f.constants_optimization
+                constants_optimization_conf=f.constants_optimization_conf
+                target=f.target
+                weights=f.weights
+                find_config=True
+
+        if (not find_config) or (n_constants<=2) or (self.program_depth  == 0) or (len(self.features_used)<1) or (self.already_bootstrapped):
+            # Case in which a 
+            # 1) FeatureNode program is passed,
+            # 2) the program does not have more than 2 constants,
+            # 3) was unabl to find optimization configuration
+            # A new tree is generated
+            #if (not find_config):
+            #    print('no config')
+            #elif (n_constants<=2):
+            #    print('less than 2 const')
+            #elif (self.program_depth  == 0):
+            #    print('no depth')
+            #elif (len(self.features_used)<1):
+            #    print('zero features used')
+            #elif (self.already_bootstrapped):
+            #    print('already bootstrapped')
+            new = Program(operations=self.operations,
+                            features=self.features,
+                            feature_probability=self.default_feature_probability,
+                            default_feature_probability=self.default_feature_probability,
+                            bool_update_feature_probability=self.bool_update_feature_probability,
+                            const_range=self.const_range,
+                            parsimony=self.parsimony,
+                            parsimony_decay=self.parsimony_decay)
+            new.init_program()
+            try:
+                new.simplify(inplace=True)
+            except ValueError:
+                #print('error in simplfy new prog')
+                new._override_is_valid = False
+            if inplace:
+                self.program = new
+                self._override_is_valid=new._override_is_valid
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
+                return self
+            return new, succesfull
+
+        offspring = copy.deepcopy(self)
+        
+        constants_boots=Bootstrapping_constants(program=offspring,
+                                                data=data,
+                                                target=target,
+                                                weights=weights,
+                                                constants_optimization=constants_optimization,
+                                                constants_optimization_conf=constants_optimization_conf,
+                                                k=k,
+                                                frac=frac,
+                                                n_jobs=n_jobs
+                                                )
+        #mask constants which are not significantly differrent from zero
+        
+        quantiles = np.quantile(constants_boots,q=[0.25,0.75],axis=0)
+        mask=quantiles.prod(0)<0
+        sum_masked=np.sum(mask)
+        constants[mask]=0.
+
+        if sum_masked>0:
+            try:
+                from symbolic_regression.simplification import extract_operation
+                offspring.set_constants(new=constants)
+                simplifed_string = sym.simplify(offspring.program)
+                new_program = extract_operation(element_to_extract=simplifed_string,
+                                                                    father=None)
+                new_program = clean_division(new_program)
+
+                offspring.program=new_program
+                succesfull=1
+                #print('!!!SUCCESSFULL BOOTSTRAP!!!!!')
+                if inplace:
+                    self.program = new_program
+                    self.already_bootstrapped = True
+                    self._hash=None
+                    return self
+                else:
+                    offspring.program=new_program
+                    offspring.already_bootstrapped = True
+                    offspring._hash=None
+                    return offspring, succesfull
+            except ValueError:
+                #print('error in simplfying sfter mask computation')
+                ## generate a new program
+                new = Program(operations=self.operations,
+                                features=self.features,
+                                feature_probability=self.default_feature_probability,
+                                default_feature_probability=self.default_feature_probability,
+                                bool_update_feature_probability=self.bool_update_feature_probability,
+                                const_range=self.const_range,
+                                parsimony=self.parsimony,
+                                parsimony_decay=self.parsimony_decay)
+                new.init_program()
+                try:
+                    new.simplify(inplace=True)
+                except ValueError:
+                    new._override_is_valid = False
+                if inplace:
+                    self.program = new
+                    self._override_is_valid = new._override_is_valid
+                    self._hash = None
+                    self.already_bootstrapped = False
+                    self.already_brgflow = False
+                    return self
+                return new, succesfull
+        else:
+            #print('no constants to mask')
+            ## generate a new program
+            new = Program(operations=self.operations,
+                            features=self.features,
+                            feature_probability=self.feature_probability,
+                            default_feature_probability=self.default_feature_probability,
+                            bool_update_feature_probability=self.bool_update_feature_probability,
+                            const_range=self.const_range,
+                            parsimony=self.parsimony,
+                            parsimony_decay=self.parsimony_decay)
+            new.init_program()
+            try:
+                new.simplify(inplace=True)
+            except ValueError:
+                #print('error in simplfy new prog')
+                new._override_is_valid = False
+            if inplace:
+                self.program = new
+                self.override_is_valid = new._override_is_valid
+                self._hash = None
+                self.already_bootstrapped = False
+                self.already_brgflow = False
+                return self
+            return new, succesfull
+            
+    

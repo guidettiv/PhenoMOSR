@@ -4,8 +4,13 @@ from typing import Union
 import numpy as np
 import pandas as pd
 import sympy as sym
+import copy
 from scipy.optimize import minimize
 from sympy.utilities.lambdify import lambdify
+from warnings import catch_warnings
+from warnings import simplefilter
+from sklearn.gaussian_process import GaussianProcessRegressor
+
 
 from symbolic_regression.multiobjective.fitness.Regression import \
     create_regression_weights
@@ -447,7 +452,14 @@ def ADAM(program, data: Union[dict, pd.Series, pd.DataFrame], target: str, weigh
     return constants, loss, log
 
 
-def ADAM2FOLD(program, data: Union[dict, pd.Series, pd.DataFrame], target: list, weights: list, constants_optimization_conf: dict, task: str, bootstrap: bool = False):
+
+def ADAM2FOLD(program, 
+              data: Union[dict, pd.Series, pd.DataFrame], 
+              target: list, 
+              weights: list, 
+              constants_optimization_conf: dict, 
+              task: str, 
+              bootstrap: bool = False):
     ''' ADAM with analytic derivatives for 2-fold programs
 
     Args:
@@ -595,9 +607,7 @@ def ADAM2FOLD(program, data: Union[dict, pd.Series, pd.DataFrame], target: list,
                 av_loss = np.nanmean(lambda1*(w1_batch[i] * (y_pred - y1_batch[i])**2)
                                      + (1-lambda1)*(w2_batch[i] * (y_pred - y2_batch[i])**2))
                 av_grad = np.array([
-                    np.nanmean(2 * (lambda1*(w1_batch[i](y_pred - y1_batch[i]))
-                                   + (1-lambda1)*(w2_batch[i](y_pred - y2_batch[i]))) * g)
-                    for g in num_grad
+                    np.nanmean(2 * (lambda1*(w1_batch[i]*(y_pred - y1_batch[i]))+ (1-lambda1)*(w2_batch[i]*(y_pred - y2_batch[i]))) * g) for g in num_grad
                 ])
 
             # try with new constants if loss is nan
@@ -625,8 +635,14 @@ def ADAM2FOLD(program, data: Union[dict, pd.Series, pd.DataFrame], target: list,
     return constants, loss, log
 
 
-def SCIPY(program, data: Union[dict, pd.Series, pd.DataFrame], target: str, weights: str, constants_optimization_conf: dict, task: str, bootstrap: bool = False):
-    ''' ADAM with analytic derivatives
+def SCIPY(program, 
+          data: Union[dict, pd.Series, pd.DataFrame], 
+          target: str, 
+          weights: str, 
+          constants_optimization_conf: dict, 
+          task: str, 
+          bootstrap: bool = False):
+    ''' SCIPY library for optimization
 
     Args:
         - program: Program
@@ -655,8 +671,7 @@ def SCIPY(program, data: Union[dict, pd.Series, pd.DataFrame], target: str, weig
 
     if not program.is_valid:  # No constants in program
         return [], [], []
-
-    n_features = len(program.features)
+    
     constants = np.array(
         [item.feature for item in program.get_constants(return_objects=True)])
     n_constants = constants.size
@@ -675,7 +690,11 @@ def SCIPY(program, data: Union[dict, pd.Series, pd.DataFrame], target: str, weig
     X_data = data[program.features].to_numpy()
 
     p_sym = program.program.render(format_diff=True)
-    pyf_prog = lambdify([x_sym, c_sym], p_sym)
+    try:
+        pyf_prog = lambdify([x_sym, c_sym], p_sym)
+    except KeyError:
+        print('key error in lambdify')
+        return constants, None, None
 
     if weights:
         if bootstrap:
@@ -692,69 +711,288 @@ def SCIPY(program, data: Union[dict, pd.Series, pd.DataFrame], target: str, weig
     else:
         w = np.ones_like(y_true)
 
-    def nll_min_regression(c, y, X, pyf_prog, weights=None):
-        n_features = X.shape[1]
-        n_constants = len(c)
-        split_X = np.split(X, n_features, 1)
-        split_c = np.split(c*np.ones_like(y), n_constants, 1)
-        y_pred = pyf_prog(tuple(split_X), tuple(split_c))
-        residual = (y_true-y_pred)
+    try:
+        if task == 'regression:wmse' or task == 'regression:wrrmse':
+            res = minimize(nll_min_regression, x0=constants, args=(
+                y_true, X_data, pyf_prog, w), method='L-BFGS-B')
+            constants = res.x
+        
+        elif task == 'binary:logistic':
+            res = minimize(nll_min_binary, x0=constants, args=(
+                y_true, X_data, pyf_prog, w), method='L-BFGS-B')
+            constants = res.x
+        
+        elif task=='regression:cox':
+            status=constants_optimization_conf['status']  
+            event_indicators=data[status]
+            event_times=data[target]
+            res = minimize(nll_min_CoxBreslow, x0=constants, args=(
+                y_true, X_data, pyf_prog, event_times,event_indicators), method='L-BFGS-B')
+            constants = res.x
 
-        if weights is not None:
-            return np.mean(weights*residual**2)
-        return np.mean(residual**2)
+        elif task=='regression:cox_efron':
+            status=constants_optimization_conf['status']  
+            event_indicators=data[status]
+            event_times=data[target]
+            res = minimize(nll_min_CoxEfron, x0=constants, args=(
+                y_true, X_data, pyf_prog, event_times,event_indicators), method='L-BFGS-B')
+            constants = res.x
 
-    def nll_min_binary(c, y, X, pyf_prog, weights=None):
-        n_features = X.shape[1]
-        n_constants = len(c)
-        split_X = np.split(X, n_features, 1)
-        split_c = np.split(c*np.ones_like(y), n_constants, 1)
-        y_pred = pyf_prog(tuple(split_X), tuple(split_c))
-        sigma = 1. / (1. + np.exp(-y_pred))
-
-        if weights is not None:
-            return -np.mean(weights*(y*np.log(sigma+1e-20) + (1.-y)*np.log(1.-sigma+1e-20)))
-        return -np.mean(y*np.log(sigma+1e-20) + (1.-y)*np.log(1.-sigma+1e-20))
-
-    def nll_min_CoxEfron(c, y, X, pyf_prog, DJs_indices, powers, RJs_indices):
-        n_features = X.shape[1]
-        n_constants = len(c)
-        split_X = np.split(X, n_features, 1)
-        split_c = np.split(c*np.ones_like(y), n_constants, 1)
-        y_pred = pyf_prog(tuple(split_X), tuple(split_c))
-        DFs = [np.sum(y_pred[els]) for els in DJs_indices]
-        MEs = [np.mean(np.exp(y_pred)[els]) for els in DJs_indices]
-        REs = [np.sum(np.exp(y_pred)[els]) for els in RJs_indices]
-        F_TIDES = [np.sum(np.log((REs[el]
-                                  - np.expand_dims(np.arange(powers[el]), 1)*MEs[el]))) for el in range(len(powers))]
-        LogLikelihood = np.sum(
-            np.array([DFs[el]-F_TIDES[el] for el in range(len(powers))]))
-
-        nll = -LogLikelihood
-        return nll
-
-    if task == 'regression:wmse' or task == 'regression:wrrmse':
-        res = minimize(nll_min_regression, x0=constants, args=(
-            y_true, X_data, pyf_prog, w), method='L-BFGS-B')
-        constants = res.x
-
-    elif task == 'binary:logistic':
-        res = minimize(nll_min_binary, x0=constants, args=(
-            y_true, X_data, pyf_prog, w), method='L-BFGS-B')
-        constants = res.x
-
-    elif task == 'regression:cox':
-        status = constants_optimization_conf['status']
-        unique_target = np.sort(
-            data[target].loc[data[status] == True].unique())
-        powers = [len(np.where(data[target] == unique_target[el])[0])
-                  for el in range(len(unique_target))]
-        RJs_indices = [np.where(data[target] >= unique_target[el])[
-            0] for el in range(len(unique_target))]
-        DJs_indices = [np.where((data[target] == unique_target[el]) *
-                                (data[status] == True))[0] for el in range(len(unique_target))]
-        res = minimize(nll_min_CoxEfron, x0=constants, args=(
-            y_true, X_data, pyf_prog, DJs_indices, powers, RJs_indices), method='L-BFGS-B')
-        constants = res.x
+        elif task=='regression:finegray':
+            status=constants_optimization_conf['status']  
+            event_indicators=data[status]
+            event_times=data[target]
+            res = minimize(nll_min_FineGrayBreslow, x0=constants, args=(
+                y_true, X_data, pyf_prog, event_times,event_indicators), method='L-BFGS-B')
+            constants = res.x
+    except ValueError:
+        return constants, None, None
 
     return constants, None, None
+
+
+
+def nll_min_regression(c, y, X, pyf_prog, weights=None):
+    n_features = X.shape[1]
+    n_constants = len(c)
+    split_X = np.split(X, n_features, 1)
+    split_c = np.split(c*np.ones_like(y), n_constants, 1)
+    y_pred = pyf_prog(tuple(split_X), tuple(split_c))
+    residual = (y-y_pred)
+
+    if weights is not None:
+        return np.mean(weights*residual**2)
+    return np.mean(residual**2)
+
+def nll_min_binary(c, y, X, pyf_prog, weights=None):
+    n_features = X.shape[1]
+    n_constants = len(c)
+    split_X = np.split(X, n_features, 1)
+    split_c = np.split(c*np.ones_like(y), n_constants, 1)
+    y_pred = pyf_prog(tuple(split_X), tuple(split_c))
+    sigma = 1. / (1. + np.exp(-y_pred))
+
+    if weights is not None:
+        return -np.mean(weights*(y*np.log(sigma+1e-20) + (1.-y)*np.log(1.-sigma+1e-20)))
+    return -np.mean(y*np.log(sigma+1e-20) + (1.-y)*np.log(1.-sigma+1e-20))
+
+def nll_min_CoxEfron(c, y, X, pyf_prog,event_times,event_indicators):
+    n_features = X.shape[1]
+    n_constants = len(c)
+    split_X = np.split(X, n_features, 1)
+    split_c = np.split(c*np.ones_like(y), n_constants, 1)
+    y_pred = pyf_prog(tuple(split_X), tuple(split_c))
+
+    unique_times, event_counts = np.unique(event_times[event_indicators == 1], return_counts=True)
+
+    LogLikelihood = 0
+    for t, d_k in zip(unique_times, event_counts):
+        risk_set = np.where(event_times >= t)[0]
+        event_set = np.where((event_times == t) & (event_indicators == 1))[0]
+        
+        sum_beta_X_i = np.sum(y_pred[event_set])
+        sum_exp_beta_X_j = np.sum(np.exp(y_pred[risk_set]))
+        
+        adjusted_sum = 0
+        for j in range(d_k):
+            adjusted_sum +=  np.log(sum_exp_beta_X_j - j / d_k * np.sum(np.exp(y_pred[event_set])))
+        
+        LogLikelihood += sum_beta_X_i - adjusted_sum
+
+    nll = -LogLikelihood
+    return nll
+
+def nll_min_CoxBreslow(c, y, X, pyf_prog,event_times,event_indicators):
+    n_features = X.shape[1]
+    n_constants = len(c)
+    split_X = np.split(X, n_features, 1)
+    split_c = np.split(c*np.ones_like(y), n_constants, 1)
+    y_pred = pyf_prog(tuple(split_X), tuple(split_c))
+
+    unique_times, event_counts = np.unique(event_times[event_indicators == 1], return_counts=True)
+
+    LogLikelihood = 0
+    for t, d_k in zip(unique_times, event_counts):
+        risk_set = np.where(event_times >= t)[0]
+        event_set = np.where((event_times == t) & (event_indicators == 1))[0]
+        
+        sum_fx_i = np.sum(y_pred[event_set])
+        sum_exp_fx_j = np.sum(np.exp(y_pred[risk_set]))
+        
+        LogLikelihood += sum_fx_i - d_k * np.log(sum_exp_fx_j)
+    nll = -LogLikelihood
+    return nll
+
+def nll_min_FineGrayBreslow(c, y, X, pyf_prog,times,indicators):
+    n_features = X.shape[1]
+    n_constants = len(c)
+    split_X = np.split(X, n_features, 1)
+    split_c = np.split(c*np.ones_like(y), n_constants, 1)
+    y_pred = pyf_prog(tuple(split_X), tuple(split_c))
+
+    # Ensure times and indicators are numpy arrays for indexing
+    times = np.asarray(times)
+    indicators = np.asarray(indicators)
+
+    # Calculate weights using vectorized approach
+    weights = calculate_weights(times, indicators)
+
+    # Filter events and get unique event times
+    unique_times, event_counts = np.unique(times[indicators==1.], return_counts=True)
+
+    # Create weight mask based on event times and censoring status
+    mask = (np.expand_dims((indicators != 2),-1))&(np.expand_dims(times,-1)<np.expand_dims(unique_times,0))
+    weights[mask] = 0
+
+    # Vectorized calculation for exp(pred) * weights
+    A=np.exp(y_pred)
+    A_w=(A*weights)
+    risk_sets = A_w.sum(axis=0)
+
+    log_likelihood = np.sum([
+            np.sum(y_pred[times == t][indicators[times == t] == 1]) - d_k * np.log(risk_sets[i])
+            for i, t, d_k in zip(range(len(unique_times)), unique_times, event_counts)
+        ])
+    nll = -log_likelihood
+
+    return nll
+
+def calculate_weights(times, indicators):
+    """
+    Calculate weights w_ij using the Kaplan-Meier estimator.
+
+    times: array of observation times
+    indicators: array of censoring/event indicators (0=censored, 1=event, 2=competing event)
+
+    Returns:
+    weights: matrix of weights w_ij
+    """
+    from lifelines import KaplanMeierFitter
+    kmf = KaplanMeierFitter()
+    kmf.fit(times, event_observed=(indicators == 0))
+
+    # Extract unique event times and survival function at these times
+    unique_times = np.unique(times[indicators == 1])
+    survival_function = kmf.survival_function_at_times(unique_times).values
+
+    # Vectorized weight calculation
+    weights = np.ones((len(times), len(unique_times)))
+
+    # Use broadcasting for efficient calculation of weights
+    times_broadcast = np.minimum(np.expand_dims(times,-1),np.expand_dims(unique_times,0))
+    original_shape=times_broadcast.shape
+
+    weights = np.reshape(survival_function,-1) / (np.reshape(kmf.survival_function_at_times(times_broadcast.flatten()),original_shape) + 1e-20)
+
+    return weights
+
+
+# surrogate or approximation for the objective function
+def surrogate_model(model):
+    def surrogate(x):
+        # catch any warning generated when making a prediction
+        with catch_warnings():
+        # ignore generated warnings
+            simplefilter("ignore")
+        if len(np.array(x).shape)==1:
+            x=np.expand_dims(np.array(x),0)
+        return model.predict(x, return_std=False) ## metti un - se stai studiando il portafoglio
+    return surrogate
+
+
+
+def GaussProcess(program, 
+             data: Union[dict, pd.Series, pd.DataFrame], 
+             target: str, 
+             weights: str, 
+             constants_optimization_conf: dict, 
+             task: str,
+             bootstrap: bool = False):
+    ''' Gaussian process with analytic derivatives
+    DA SISTEMARE!!!
+    Args:
+        - program: Program
+            The program to optimize
+        - data: dict, pd.Series, pd.DataFrame
+            The data to fit the program
+        - target: str
+        - weights: str
+            Usless but kept to keep notation uniform
+        - constants_optimization_conf: dict
+            Dictionary with the following
+            - learning_rate: float
+                The learning rate
+            - batch_size: int
+                The batch size
+            - epochs: int
+                The number of epochs
+        - task: str
+            The task to optimize (Useless at the moment, useful when having more than one trading algorithm)
+
+    Returns:
+        - constants: np.array
+            The optimized constants
+        - loss: list
+            The loss at each epoch
+        - log: list
+            The constants at each epoch
+    '''
+    
+    iters=constants_optimization_conf['iters']
+        
+    if not program.is_valid:  # Not valid
+        return [], [], []
+
+    n_constants = len(program.get_constants())
+
+    if n_constants == 0:  # No constants in program
+        return [], [], []
+
+    ## sample n=iters random arrays to be used as constants
+    cmin,cmax=program.const_range
+    constants_sampled=np.reshape(np.random.uniform(low=cmin, high=cmax,  size=iters*n_constants),(iters,n_constants))
+    constants_sampled=[list(el) for el in list(constants_sampled)]
+
+    hv_ftn = [ftn for ftn in program.fitness_functions if (ftn.minimize and (ftn.label != 'ModComplex') and (ftn.label != 'Complexity'))]
+    
+    neg_hv_list=[]
+    for constants in constants_sampled:
+        p=copy.deepcopy(program)
+        p.set_constants(constants)
+        hv_dims=[ftn.hypervolume_reference-ftn.evaluate(p,data,validation=True) for ftn in hv_ftn]
+        neg_hv_list.append(-np.prod(hv_dims))
+    assert len(constants_sampled) == len(neg_hv_list), "len of constants_sampled and hv_list should be the same"
+
+    constants_sampled = np.array(constants_sampled)  # Convert to NumPy array (2D)
+    neg_hv_list = np.array(neg_hv_list)  # Convert to NumPy array (1D)
+
+    mask = ~np.isnan(neg_hv_list)  # Create a mask based on neg_hv_list
+    # Apply mask to both neg_hv_list and constants_sampled
+    neg_hv_list = neg_hv_list[mask]
+    constants_sampled = constants_sampled[mask]
+
+    # Convert back to lists
+    neg_hv_list = neg_hv_list.tolist()
+    constants_sampled = constants_sampled.tolist()
+
+    new_constants=[]
+    try:
+        if len(neg_hv_list)>5:
+            #try: 
+            #identify our best guess based on sampled constants
+            guess_constants=constants_sampled[np.nanargmin(neg_hv_list)]
+
+            #once we collected more than n_constants*iter samples of constants, estimate new program constants with gaussian process
+            model = GaussianProcessRegressor()
+            # fit the model
+            model.fit(np.array(constants_sampled), np.expand_dims(neg_hv_list,1))
+            surrogate=surrogate_model(model)
+            res=minimize(surrogate, np.array(guess_constants), method='BFGS')
+            new_constants=list(res.x)
+        return new_constants, None, None
+    except ValueError:
+        return new_constants, None, None
+
+    
+
+
