@@ -1,3 +1,4 @@
+import traceback
 import warnings
 from typing import Union
 
@@ -14,7 +15,7 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 
 from symbolic_regression.multiobjective.fitness.Regression import \
     create_regression_weights
-
+from symbolic_regression.preprocessing import check_assumptions
 warnings.filterwarnings("ignore")
 
 
@@ -93,8 +94,8 @@ def SGD(program, data: Union[dict, pd.Series, pd.DataFrame], target: str, weight
     x_sym = ''
     for f in program.features:
         x_sym += f'{f},'
-    x_sym = sym.symbols(x_sym)
-    c_sym = sym.symbols('c0:{}'.format(n_constants))
+    x_sym = sym.symbols(x_sym, real=True)
+    c_sym = sym.symbols('c0:{}'.format(n_constants),real=True)
 
     # Initialize ground truth and data arrays
     y_true = np.reshape(data[target].to_numpy(), (data[target].shape[0], 1))
@@ -303,8 +304,8 @@ def ADAM(program, data: Union[dict, pd.Series, pd.DataFrame], target: str, weigh
     x_sym = ''
     for f in program.features:
         x_sym += f'{f},'
-    x_sym = sym.symbols(x_sym)
-    c_sym = sym.symbols('c0:{}'.format(n_constants))
+    x_sym = sym.symbols(x_sym, real=True)
+    c_sym = sym.symbols('c0:{}'.format(n_constants),real=True)
 
     # Initialize ground truth and data arrays
     y_true = np.reshape(data[target].to_numpy(), (data[target].shape[0], 1))
@@ -524,8 +525,8 @@ def ADAM2FOLD(program,
     x_sym = ''
     for f in program.features:
         x_sym += f'{f},'
-    x_sym = sym.symbols(x_sym)
-    c_sym = sym.symbols('c0:{}'.format(n_constants))
+    x_sym = sym.symbols(x_sym, real=True)
+    c_sym = sym.symbols('c0:{}'.format(n_constants),real=True)
 
     # Initialize ground truth and data arrays
     y_true_1 = np.reshape(data[target[0]].to_numpy(),
@@ -678,24 +679,16 @@ def SCIPY(program,
 
     if n_constants == 0:  # No constants in program
         return [], [], []
-
-    # Initialize symbols for variables and constants
-    x_sym = ''
-    for f in program.features:
-        x_sym += f'{f},'
-    x_sym = sym.symbols(x_sym)
-    c_sym = sym.symbols('c0:{}'.format(n_constants))
-
+    
     y_true = np.reshape(data[target].to_numpy(), (data[target].shape[0], 1))
     X_data = data[program.features].to_numpy()
 
-    p_sym = program.program.render(format_diff=True)
-    try:
-        pyf_prog = lambdify([x_sym, c_sym], p_sym)
-    except KeyError:
-        print('key error in lambdify')
-        return constants, None, None
+    pyf_prog = program.lambdify()
 
+    if not pyf_prog:
+        program._override_is_valid = False
+        return constants, None, None
+   
     if weights:
         if bootstrap:
             if task == 'regression:wmse' or task == 'regression:wrrmse':
@@ -746,8 +739,9 @@ def SCIPY(program,
                 y_true, X_data, pyf_prog, event_times,event_indicators), method='L-BFGS-B')
             constants = res.x
     except ValueError:
+        program._override_is_valid = False
         return constants, None, None
-
+    
     return constants, None, None
 
 
@@ -954,7 +948,6 @@ def GaussProcess(program,
     constants_sampled=[list(el) for el in list(constants_sampled)]
 
     hv_ftn = [ftn for ftn in program.fitness_functions if (ftn.minimize and (ftn.label != 'ModComplex') and (ftn.label != 'Complexity'))]
-    
     neg_hv_list=[]
     for constants in constants_sampled:
         p=copy.deepcopy(program)
@@ -962,7 +955,6 @@ def GaussProcess(program,
         hv_dims=[ftn.hypervolume_reference-ftn.evaluate(p,data,validation=True) for ftn in hv_ftn]
         neg_hv_list.append(-np.prod(hv_dims))
     assert len(constants_sampled) == len(neg_hv_list), "len of constants_sampled and hv_list should be the same"
-
     constants_sampled = np.array(constants_sampled)  # Convert to NumPy array (2D)
     neg_hv_list = np.array(neg_hv_list)  # Convert to NumPy array (1D)
 

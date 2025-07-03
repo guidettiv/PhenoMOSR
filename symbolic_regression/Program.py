@@ -1,14 +1,16 @@
 import copy
 import logging
 import random
-#import signal
-from typing import Dict, List, Tuple, Union
+from typing import Callable, Dict, List, Tuple, Union
+
 
 import numpy as np
 import pandas as pd
 import sympy
 from joblib import Parallel, delayed
 from pytexit import py2tex
+import traceback
+import sympy
 
 from symbolic_regression.multiobjective.fitness.Base import BaseFitness
 from symbolic_regression.multiobjective.hypervolume import _HyperVolume
@@ -18,6 +20,9 @@ from symbolic_regression.Node import (FeatureNode, InvalidNode, Node,
                                       OperationNode)
 from symbolic_regression.operators import (OPERATOR_ADD, OPERATOR_MUL,
                                            OPERATOR_POW)
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("Simplify operation timed out")
 
 
 class Program:
@@ -55,6 +60,7 @@ class Program:
     def __init__(self, 
                  operations: List[Dict], 
                  features: List[str], 
+                 feature_assumption: dict = None,
                  feature_probability: List = [], 
                  default_feature_probability: List = [], 
                  bool_update_feature_probability: bool = False,
@@ -100,6 +106,7 @@ class Program:
 
         self.operations: List[Dict] = operations
         self.features: List[str] = features
+        self.feature_assumption = feature_assumption
         self.feature_probability: List = feature_probability
         self.default_feature_probability: List = default_feature_probability
         self.bool_update_feature_probability: bool = bool_update_feature_probability
@@ -553,7 +560,8 @@ class Program:
 
         return self.program.evaluate(data=data)
 
-    def _generate_tree(self, depth=-1, parsimony: float = .8, parsimony_decay: float = .85, father: Union[Node, None] = None, force_constant: bool = False) -> Node:
+    def _generate_tree(self, depth=-1, 
+                       parsimony: float = .8, parsimony_decay: float = .85, father: Union[Node, None] = None, force_constant: bool = False, count:int=0) -> Node:
         """ This function generate a tree of a given depth.
 
         Args:
@@ -606,7 +614,9 @@ class Program:
         selector_operation = random.random()
         if ((selector_operation < parsimony and depth == -1) or (depth > 0)) and not force_constant:
             # We generate a random operation
-
+            ##TO BE REMOVED
+            #count+=1
+            #print(count)
             operation = random.choice(self.operations)
             node = gen_operation(operation_conf=operation, father=father)
 
@@ -624,7 +634,7 @@ class Program:
                                         father=node,
                                         parsimony=parsimony * parsimony_decay,
                                         parsimony_decay=parsimony_decay,
-                                        force_constant=force_constant))
+                                        force_constant=force_constant,count=count))
             force_constant = False
 
         else:
@@ -864,6 +874,37 @@ class Program:
 
         return self.program.is_valid and self._override_is_valid
 
+    def lambdify(self) -> Callable:
+        # Initialize symbols for variables and constants
+        n_constants = len(self.get_constants(return_objects=True))
+
+        x_sym = ''
+        for f in self.features:
+            x_sym += f'{f},'
+        x_sym = sympy.symbols(x_sym, real=True)
+        c_sym = sympy.symbols('c0:{}'.format(n_constants),real=True)
+
+        p_sym = self.program.render(format_diff=True)
+        try:
+            pyf_prog = sympy.lambdify([x_sym, c_sym], p_sym)
+
+        except KeyError:
+            #print(p_sym,x_sym,c_sym)
+            print('key error in lambdify')
+            #traceback.print_exc() 
+            return None
+        except AttributeError:
+            #print(p_sym,x_sym,c_sym)
+            print('Attribtute error in lambdify')
+            #traceback.print_exc() 
+            return None
+        except ImportError:
+            print('ImportError error in lambdify')
+            #traceback.print_exc() 
+            return None
+    
+        return pyf_prog
+    
     def optimize(self,
                  data: Union[dict, pd.Series, pd.DataFrame],
                  target: str,
@@ -962,6 +1003,8 @@ class Program:
             elif constants_optimization == 'GaussianProcess':
                 assert task=='non-derivative:GP', 'Only IC strategy is implemented with GaussianProcess optimization'
                 f_opt = GaussProcess
+                # need to simplify here as this usually happens inside derivative objectives 
+                # so here it wouldn't happen
                 to_optimize.simplify(inplace=True)
 
             else:
@@ -1120,60 +1163,38 @@ class Program:
             - Program
                 The simplified program
         """
-        from symbolic_regression.simplification import extract_operation
+        from symbolic_regression.simplification import parse_and_extract_operation
+        #initialize a timeoutdecorator compatible with joblib
+        from functools import wraps
+        import threading
+        import time
+        
+        # Timeout decorator that works with joblib
+        def timeout(max_seconds):
+            def decorator(func):
+                @wraps(func)
+                def wrapper(*args, **kwargs):
+                    result = [TimeoutError(f"Function timed out after {max_seconds} seconds")]
+                    
+                    def target():
+                        try:
+                            result[0] = func(*args, **kwargs)
+                        except Exception as e:
+                            result[0] = e
+                    
+                    thread = threading.Thread(target=target)
+                    thread.daemon = True
+                    thread.start()
+                    thread.join(max_seconds)
+                    
+                    if isinstance(result[0], Exception):
+                        raise result[0]
+                    return result[0]
+                return wrapper
+            return decorator
 
-        def find_division_nodes(node):
-            """
-            Recursively traverses the tree starting at 'node' and collects 
-            all OperationNode instances whose symbol is '/'.
-            
-            Returns:
-                A list of matching nodes.
-            """
-            from symbolic_regression.Node import OperationNode,FeatureNode
-            division_nodes = []
-            
-            if isinstance(node, OperationNode):
-                if node.symbol == "/":
-                    division_nodes.append(node)
-                # Traverse each operand (child) recursively
-                for child in node.operands:
-                    division_nodes.extend(find_division_nodes(child))
-            # If it's a FeatureNode, we don't do anything (it has no children to traverse)
-            
-            return division_nodes
-
-        def clean_one_division(program, mutate_point):
-            mutate_point_father=mutate_point.father
-            if mutate_point_father:
-                mutate_point_grandfather=mutate_point_father.father
-    
-            if mutate_point_father and (mutate_point.operands[0].feature==1.0) and (mutate_point.father.symbol == '*'):
-                #replace 1 with feature appearing as the first argument of the product (father) and connect edges
-                index_mutate_point=mutate_point_father.operands.index(mutate_point)
-                mutate_point.operands[0]=mutate_point_father.operands[1-index_mutate_point]
-                mutate_point_father.operands[1-index_mutate_point].father=mutate_point
-                #link division a layer above
-                if mutate_point_grandfather:
-                    #find right index to glue the grandfather node and the division node.
-                    right_index=mutate_point_grandfather.operands.index(mutate_point.father)
-                    mutate_point_grandfather.operands[right_index]=mutate_point
-                    mutate_point.father=mutate_point_grandfather
-                    return program
-                else: 
-                    mutate_point.father=mutate_point_grandfather
-                    return mutate_point
-            else:
-                return program
-
-        def clean_division(program):
-            import copy
-            new_program=copy.deepcopy(program)
-            mutate_point_list=find_division_nodes(new_program)[::-1]
-            for mutate_point in mutate_point_list:
-                new_program=clean_one_division(new_program, mutate_point)  
-            return new_program
-
+        # Function to perform simplification with timeout
+        @timeout(10)
         def simplify_program(program: Union[Program, str]) -> Union[FeatureNode, OperationNode, InvalidNode]:
             """ This function simplify a program using a SymPy backend
 
@@ -1187,21 +1208,27 @@ class Program:
 
                 logging.debug(f'Simplifying program {program}')
 
+                #print('begin parse expr')
+                
                 try:
-                    if isinstance(program, Program):
-                        simplified = sympy.parse_expr(program.program.render())
-                    else:
-                        simplified = sympy.parse_expr(program)
-                except:
-                    program._override_is_valid = False
+                                    
+                    string = program.program.render() if isinstance(program, Program) else program
+                    new_program = parse_and_extract_operation(string,simplify=True)
+                    #print(f'COMPARING:\nprogram {string}\nsympy obj {sympy_obj}\nnumeric_eval {sympy.pretty(expr_numeric_evaluated)}\nsimplified {simplified}\nsimplified {new_program}')
+                    #print(f'COMPARING:\nprogram {string}\nsimplified {new_program}')
+                    
+
+
+                except Exception as e:
+                    print("other error in sympy.simplify inside simplify:", e)
+                    print(f'program : {program.program}')
+                    print(f'program render : {program.program.render()}')
+                    #traceback.print_exc()  # if you want the full traceback
+                    #program._override_is_valid = False
                     return program.program
                 logging.debug(
                     f'Extracting the program tree from the simplified')
-
-                new_program = extract_operation(element_to_extract=simplified,
-                                                father=None)
-                new_program = clean_division(new_program)
-                
+                #print('end parse expr. Begin clean div')
 
                 logging.debug(f'Simplified program {new_program}')
 
@@ -1218,18 +1245,25 @@ class Program:
         else:
             to_return = copy.deepcopy(self)
 
-        if inject:
-            simp = simplify_program(inject)
-        else:
-            simp = simplify_program(to_return)
-
+        try:
+            if inject:
+                simp = simplify_program(inject)
+            else:
+                simp = simplify_program(to_return)
+        except TimeoutError:
+            print('Simplification timedout after 10 seconds')
+            return to_return
+        
         to_return.program = simp
         if not simp:
             to_return._override_is_valid = False
 
         # Reset the hash to force the re-computation
         to_return._hash = None
+    
         return to_return
+
+
 
     def to_affine(self, data: Union[dict, pd.Series, pd.DataFrame], target: str, inplace: bool = False) -> 'Program':
         """ This function create an affine version of the program between the target maximum and minimum
@@ -2048,10 +2082,56 @@ class Program:
 
         return new
     
+    def compute_FIM_diag(self, data):
+        from sympy import lambdify
+        def DiracDeltaV(x):
+            return np.where(np.abs(x) < 1e-7, 1e7, 0)
+        
+        constants = np.array(self.get_constants())
+        n_constants=len(constants)
+        n_features = len(self.features)
+
+        split_c = np.split(constants *np.ones((data.shape[0],1)), n_constants, 1)
+        split_X = np.split(data[self.features].to_numpy(), n_features, 1)
+
+        x_sym = ''
+        for f in self.features:
+            x_sym += f'{f},'
+        x_sym = sympy.symbols(x_sym, real=True)
+        c_sym = sympy.symbols('c0:{}'.format(n_constants), real=True)
+
+        local_dict={}
+        for x in x_sym:
+            local_dict[str(x)]=x
+        for c in c_sym:
+            local_dict[str(c)]=c
+        
+        ##compute FIM
+        string = self.program.render(format_diff=True)
+        expr = sympy.parse_expr(string).subs(local_dict)
+        FIM_avg=[]
+        for ci in c_sym:
+            row=[]
+            for cj in c_sym:
+                entry=sympy.diff(expr, ci).doit() * sympy.diff(expr, cj).doit()
+                f_entry=lambdify([x_sym, c_sym], 
+                                entry, 
+                                modules=['numpy', {'DiracDelta': DiracDeltaV}])
+                avg_entry=np.mean(f_entry(tuple(split_X), tuple(split_c)))
+                #print(f'\n\n\n diff1 = {sympy.diff(expr, ci).doit()}\navg entry= {avg_entry}')
+                row.append(float(avg_entry))
+            FIM_avg.append(row)
+        FIM_avg=np.array(FIM_avg)
+        diag_FIM_avg=np.diag(FIM_avg)
+        #print(f'\n\n\ndiagFIM matrix {diag_FIM_avg}\n\n\n')
+        return diag_FIM_avg
+
+
+
     def regularize_brgflow(self, 
                             data,
                             knee=False, 
-                            threshold=0.01,
+                            threshold=0.001,
                             inplace: bool = False) -> 'Program':
         """ This method perform a regularization of the tree aimed to streamline the tree structure and remove redundancies
 
@@ -2072,65 +2152,11 @@ class Program:
                 The new program after the mutation is applied
         """
         import copy
-        import sympy as sym
         from symbolic_regression.Program import Program
-        from symbolic_regression.simplification import extract_operation
+        from symbolic_regression.simplification import extract_operation, clean_division
         from sympy import lambdify
 
-        def DiracDeltaV(x):
-            return np.where(np.abs(x) < 1e-7, 1e7, 0)
-
-        def find_division_nodes(node):
-            """
-            Recursively traverses the tree starting at 'node' and collects 
-            all OperationNode instances whose symbol is '/'.
-            
-            Returns:
-                A list of matching nodes.
-            """
-            from symbolic_regression.Node import OperationNode
-            division_nodes = []
-            
-            if isinstance(node, OperationNode):
-                if node.symbol == "/":
-                    division_nodes.append(node)
-                # Traverse each operand (child) recursively
-                for child in node.operands:
-                    division_nodes.extend(find_division_nodes(child))
-            # If it's a FeatureNode, we don't do anything (it has no children to traverse)
-            
-            return division_nodes
-
-        def clean_division(program):
-            import copy
-            new_program=copy.deepcopy(program)
-            mutate_point_list=find_division_nodes(new_program)[::-1]
-            for mutate_point in mutate_point_list:
-                new_program=clean_one_division(new_program, mutate_point)  
-            return new_program
-
-        def clean_one_division(program, mutate_point):
-            mutate_point_father=mutate_point.father
-            if mutate_point_father:
-                mutate_point_grandfather=mutate_point_father.father
-    
-            if mutate_point_father and (mutate_point.operands[0].feature==1.0) and (mutate_point.father.symbol == '*'):
-                #replace 1 with feature appearing as the first argument of the product (father) and connect edges
-                index_mutate_point=mutate_point_father.operands.index(mutate_point)
-                mutate_point.operands[0]=mutate_point_father.operands[1-index_mutate_point]
-                mutate_point_father.operands[1-index_mutate_point].father=mutate_point
-                #link division a layer above
-                if mutate_point_grandfather:
-                    #find right index to glue the grandfather node and the division node.
-                    right_index=mutate_point_grandfather.operands.index(mutate_point.father)
-                    mutate_point_grandfather.operands[right_index]=mutate_point
-                    mutate_point.father=mutate_point_grandfather
-                    return program
-                else: 
-                    mutate_point.father=mutate_point_grandfather
-                    return mutate_point
-            else:
-                return program
+        
             
         def find_knee_value_orthogonal(array):
             # 1) Sort the array
@@ -2164,12 +2190,13 @@ class Program:
             knee_index = np.argmax(distances)
             
             # Return the corresponding (sorted) value
+            #print(f'\nTHRESHOLD: {sorted_array[knee_index]}\n')
             return sorted_array[knee_index]
         
+            
         succesfull=0
         constants = np.array([item.feature for item in self.get_constants(return_objects=True)])
         n_constants=len(constants)
-        n_features = len(self.features)
 
         if (n_constants<=2) or (self.program_depth  == 0) or (len(self.features_used)<1) or (self.already_brgflow):
             #if (self.already_brgflow):
@@ -2186,6 +2213,7 @@ class Program:
             # A new tree is generated.
             new = Program(operations=self.operations,
                           features=self.features,
+                          feature_assumption=self.feature_assumption,
                           feature_probability=self.default_feature_probability,
                           default_feature_probability=self.default_feature_probability,
                           bool_update_feature_probability=self.bool_update_feature_probability,
@@ -2198,6 +2226,7 @@ class Program:
             except ValueError:
                 #print('error in simplfy new prog')
                 new._override_is_valid = False
+
             if inplace:
                 self.program = new
                 self.override_is_valid = new._override_is_valid
@@ -2206,45 +2235,27 @@ class Program:
                 self.already_brgflow = False
                 return self
             return new, succesfull
-        offspring = copy.deepcopy(self)
         
-        x_sym = ''
-        for f in offspring.features:
-            x_sym += f'{f},'
-        x_sym = sym.symbols(x_sym)
-        c_sym = sym.symbols('c0:{}'.format(n_constants))
-        p_sym = offspring.program.render(format_diff=True)
 
-        split_c = np.split(
-                constants *np.ones((data.shape[0],1)), n_constants, 1)
-        split_X = np.split(
-            data[offspring.features].to_numpy(), n_features, 1)
 
-        ##compute FIM
-        log_expr = sym.parse_expr('log('+p_sym+')')
-        FIM_avg = []
+        offspring = copy.deepcopy(self)
+
         try:
-            for ci in c_sym:
-                row=[]
-                for cj in c_sym:
-                    entry=sym.diff(log_expr, ci).doit()*sym.diff(log_expr, cj).doit()
-                    f_entry=lambdify([x_sym, c_sym], 
-                                    entry, 
-                                    modules=['numpy', {'DiracDelta': DiracDeltaV, 'Sqrt': np.sqrt}])
-                    avg_entry=np.mean(f_entry(tuple(split_X), tuple(split_c)))
-                    row.append(float(avg_entry))
-                FIM_avg.append(row)
-            FIM_avg=np.array(FIM_avg)
-        except NameError:
-            print('name error brutto: new prog')
-            #print(x_sym, c_sym)
-            #print(entry)
+            diag_FIM_avg=offspring.compute_FIM_diag(data)
+            diag_FIM_avg=diag_FIM_avg/np.max(diag_FIM_avg)
 
-
-
+        except (NameError, KeyError) as e:
+            if isinstance(e, KeyError) and str(e) == "'ComplexInfinity'":
+                # Ignore only this specific KeyError
+                print('complex infinity')
+            else:
+                # Re-raise any other KeyError or any NameError               
+                print('name error brutto in brgflow: new prog')
+                #traceback.print_exc()  # if you want the full traceback
             ## generate a new program
             new = Program(operations=self.operations,
                             features=self.features,
+                            feature_assumption=self.feature_assumption,
                             feature_probability=self.default_feature_probability,
                             default_feature_probability=self.default_feature_probability,
                             bool_update_feature_probability=self.bool_update_feature_probability,
@@ -2256,7 +2267,8 @@ class Program:
                 new.simplify(inplace=True)
             except ValueError:
                 #print('error in simplfy new prog')
-                new._override_is_valid = False
+                #new._override_is_valid = False
+                pass
             if inplace:
                 self.program = new
                 self.override_is_valid = new._override_is_valid
@@ -2267,25 +2279,33 @@ class Program:
             return new, succesfull
         
         if knee:
-            threshold_knee = find_knee_value_orthogonal(np.diag(FIM_avg))
+            threshold_knee = find_knee_value_orthogonal(diag_FIM_avg)
             threshold=np.min([threshold_knee,threshold])
 
-        mask=np.diag(FIM_avg)<=threshold 
+        mask=diag_FIM_avg<=threshold 
         sum_masked=np.sum(mask)
         constants[mask]=0.
 
         if sum_masked>0:
             try:
-                offspring.set_constants(new=constants)
-                
-                simplifed_string = sym.simplify(offspring.program)
-            
-                new_program = extract_operation(element_to_extract=simplifed_string,
-                                                                    father=None)
-                new_program = clean_division(new_program)
+                x_sym = ''
+                for f in self.features:
+                    x_sym += f'{f},'
+                x_sym = sympy.symbols(x_sym, real=True)
 
+                local_dict={}
+                for x in x_sym:
+                    local_dict[str(x)]=x
+
+                offspring.set_constants(new=constants)
+                string = offspring.program.render()
+                expr = sympy.parse_expr(string).subs(local_dict)
+                new_program = extract_operation(expr)
+                new_program = clean_division(new_program)
                 offspring.program=new_program
-                #print('!!!!!BRGFLOW SUCCESSFULLY APPLIED!!!!')
+
+    
+                #print(f'!!!!!BRGFLOW SUCCESSFULLY APPLIED!!!!\n/Before:{self.program}\nAfter:{offspring.program}\nFIM:{diag_FIM_avg}')
                 succesfull=1
                 if inplace:
                     self.program = new_program
@@ -2293,16 +2313,17 @@ class Program:
                     self.already_brgflow = True
                     return self
                 else:
-                    offspring.program=new_program
                     offspring.already_brgflow = True
                     offspring._hash = None
                     return offspring, succesfull
 
             except ValueError:
-                #print('error in brgpart')
+                print('error in brgflow simplification')
+                #traceback.print_exc()
                 ## generate a new program
                 new = Program(operations=self.operations,
                                 features=self.features,
+                                feature_assumption=self.feature_assumption,
                                 feature_probability=self.default_feature_probability,
                                 default_feature_probability=self.default_feature_probability,
                                 bool_update_feature_probability=self.bool_update_feature_probability,
@@ -2313,8 +2334,9 @@ class Program:
                 try:
                     new.simplify(inplace=True)
                 except ValueError:
+                    pass
                     #print('error in simplfy new prog')
-                    new._override_is_valid = False
+                    #new._override_is_valid = False
                 if inplace:
                     self.program = new
                     self.override_is_valid = new._override_is_valid
@@ -2328,6 +2350,7 @@ class Program:
             ## generate a new program
             new = Program(operations=self.operations,
                             features=self.features,
+                            feature_assumption=self.feature_assumption,
                             feature_probability=self.default_feature_probability,
                             default_feature_probability=self.default_feature_probability,
                             bool_update_feature_probability=self.bool_update_feature_probability,
@@ -2339,7 +2362,8 @@ class Program:
                 new.simplify(inplace=True)
             except ValueError:
                 #print('error in simplfy new prog')
-                new._override_is_valid = False
+                #new._override_is_valid = False
+                pass
             if inplace:
                 self.program = new
                 self.override_is_valid = new._override_is_valid
@@ -2352,7 +2376,7 @@ class Program:
     def regularize_bootstrap(self, 
                             data,
                             k=150,
-                            frac=0.7,
+                            frac=0.70,
                             n_jobs=3,
                             inplace: bool = False) -> 'Program':
         """ This method perform a regularization of the tree aimed to streamline the tree structure and remove redundancies
@@ -2374,81 +2398,34 @@ class Program:
                 The new program after the mutation is applied
         """
         import copy
-        import sympy as sym
         from symbolic_regression.Program import Program
         
-        def find_division_nodes(node):
-            """
-            Recursively traverses the tree starting at 'node' and collects 
-            all OperationNode instances whose symbol is '/'.
-            
-            Returns:
-                A list of matching nodes.
-            """
-            from symbolic_regression.Node import OperationNode
-            division_nodes = []
-            
-            if isinstance(node, OperationNode):
-                if node.symbol == "/":
-                    division_nodes.append(node)
-                # Traverse each operand (child) recursively
-                for child in node.operands:
-                    division_nodes.extend(find_division_nodes(child))
-            # If it's a FeatureNode, we don't do anything (it has no children to traverse)
-            
-            return division_nodes
-
-        def clean_division(program):
-            import copy
-            new_program=copy.deepcopy(program)
-            mutate_point_list=find_division_nodes(new_program)[::-1]
-            for mutate_point in mutate_point_list:
-                new_program=clean_one_division(new_program, mutate_point)  
-            return new_program
-
-        def clean_one_division(program, mutate_point):
-            mutate_point_father=mutate_point.father
-            if mutate_point_father:
-                mutate_point_grandfather=mutate_point_father.father
-            
-            if (mutate_point.operands[0].feature==1.0) and (mutate_point.father.symbol == '*'):
-                #replace 1 with feature appearing as the first argument of the product (father) and connect edges
-                index_mutate_point=mutate_point_father.operands.index(mutate_point)
-                mutate_point.operands[0]=mutate_point_father.operands[1-index_mutate_point]
-                mutate_point_father.operands[1-index_mutate_point].father=mutate_point
-                #link division a layer above
-                if mutate_point_grandfather:
-                    #find right index to glue the grandfather node and the division node.
-                    right_index=mutate_point_grandfather.operands.index(mutate_point.father)
-                    mutate_point_grandfather.operands[right_index]=mutate_point
-                    mutate_point.father=mutate_point_grandfather
-                    return program
-                else: 
-                    mutate_point.father=mutate_point_grandfather
-                    return mutate_point
-            else:
-                return program
-            
+        
         def single_bootstrap(program,
-                            data,
-                            target,
-                            weights,
-                            constants_optimization,
-                            constants_optimization_conf,
-                            frac=0.6,
-                            low=-1,
-                            high=1):
-            
-            import copy
+                    data,
+                    target,
+                    weights,
+                    constants_optimization,
+                    constants_optimization_conf,
+                    frac=0.6,
+                    low=-1,
+                    high=1):
+    
+            # Sample data
             bs_data = data.sample(frac=frac, replace=False)
-            bs_data[weights]=1.
+            bs_data[weights] = 1.0
+            
+            # Create a copy of the program
             recalibrated = copy.deepcopy(program)
-            recalibrated.set_constants(new=list(np.random.uniform(low=low,
-                                                        high=high,
-                                                        size=len(program.get_constants())
-                                                            ))
-                                        )
-            optimized=recalibrated.optimize(
+            
+            # Set random constants
+            new_constants = list(np.random.uniform(low=low, 
+                                                high=high, 
+                                                size=len(program.get_constants())))
+            recalibrated.set_constants(new=new_constants)
+            
+            # Optimize
+            optimized = recalibrated.optimize(
                         data=bs_data,
                         target=target,
                         weights=weights,
@@ -2456,6 +2433,7 @@ class Program:
                         constants_optimization_conf=constants_optimization_conf,
                         inplace=False
                     )
+            
             return optimized.get_constants(return_objects=False)
 
         def Bootstrapping_constants(program,
@@ -2471,12 +2449,13 @@ class Program:
             import copy
             from typing import List
 
-            n_constants = len(program.get_constants(return_objects=False))
+            n_constants = len(program.get_constants())
             n_features_used = len(program.features_used)
             if not (n_constants > 0 and n_features_used > 0):
+                print('This should never happen')
                 return None
             
-
+    
             bootstrapped_constants: List[float] = Parallel(n_jobs=n_jobs)(delayed(single_bootstrap)(program=program,
                                                                                                 data=data,
                                                                                                 target=target,
@@ -2485,8 +2464,10 @@ class Program:
                                                                                                 constants_optimization_conf=constants_optimization_conf,
                                                                                                 frac=frac) for _ in range(k))
             
+            
             return np.array(bootstrapped_constants)
         
+            
         succesfull=0
         constants = np.array([item.feature for item in self.get_constants(return_objects=True)])
         n_constants=len(constants)
@@ -2518,6 +2499,7 @@ class Program:
             #    print('already bootstrapped')
             new = Program(operations=self.operations,
                             features=self.features,
+                            feature_assumption=self.feature_assumption,
                             feature_probability=self.default_feature_probability,
                             default_feature_probability=self.default_feature_probability,
                             bool_update_feature_probability=self.bool_update_feature_probability,
@@ -2529,14 +2511,15 @@ class Program:
                 new.simplify(inplace=True)
             except ValueError:
                 #print('error in simplfy new prog')
-                new._override_is_valid = False
+                #new._override_is_valid = False
+                pass
             if inplace:
                 self.program = new
                 self._override_is_valid=new._override_is_valid
                 self._hash = None
                 self.already_bootstrapped = False
                 self.already_brgflow = False
-                return self
+                return self, succesfull
             return new, succesfull
 
         offspring = copy.deepcopy(self)
@@ -2556,27 +2539,37 @@ class Program:
         quantiles = np.quantile(constants_boots,q=[0.25,0.75],axis=0)
         mask=quantiles.prod(0)<0
         sum_masked=np.sum(mask)
+        or_constants=constants.copy()
         constants[mask]=0.
 
         if sum_masked>0:
             try:
-                from symbolic_regression.simplification import extract_operation
-                offspring.set_constants(new=constants)
-                simplifed_string = sym.simplify(offspring.program)
-                new_program = extract_operation(element_to_extract=simplifed_string,
-                                                                    father=None)
-                new_program = clean_division(new_program)
+                from symbolic_regression.simplification import extract_operation, clean_division
+                x_sym = ''
+                for f in self.features:
+                    x_sym += f'{f},'
+                x_sym = sympy.symbols(x_sym, real=True)
 
+                local_dict={}
+                for x in x_sym:
+                    local_dict[str(x)]=x
+
+                offspring.set_constants(new=constants)
+                string = offspring.program.render()
+                expr = sympy.parse_expr(string).subs(local_dict)
+                new_program = extract_operation(expr)
+                new_program = clean_division(new_program)
                 offspring.program=new_program
+
                 succesfull=1
-                #print('!!!SUCCESSFULL BOOTSTRAP!!!!!')
+                #print(f'!!!SUCCESSFULL BOOTSTRAP!!!!!\nBefore:{self.program}\nold const:{or_constants}\nnew const {constants}\nAfter:{offspring.program}')
+                
                 if inplace:
                     self.program = new_program
                     self.already_bootstrapped = True
                     self._hash=None
-                    return self
+                    return self, succesfull
                 else:
-                    offspring.program=new_program
                     offspring.already_bootstrapped = True
                     offspring._hash=None
                     return offspring, succesfull
@@ -2585,6 +2578,7 @@ class Program:
                 ## generate a new program
                 new = Program(operations=self.operations,
                                 features=self.features,
+                                feature_assumption=self.feature_assumption,
                                 feature_probability=self.default_feature_probability,
                                 default_feature_probability=self.default_feature_probability,
                                 bool_update_feature_probability=self.bool_update_feature_probability,
@@ -2595,20 +2589,21 @@ class Program:
                 try:
                     new.simplify(inplace=True)
                 except ValueError:
-                    new._override_is_valid = False
+                    pass
                 if inplace:
                     self.program = new
                     self._override_is_valid = new._override_is_valid
                     self._hash = None
                     self.already_bootstrapped = False
                     self.already_brgflow = False
-                    return self
+                    return self, succesfull
                 return new, succesfull
         else:
             #print('no constants to mask')
             ## generate a new program
             new = Program(operations=self.operations,
                             features=self.features,
+                            feature_assumption=self.feature_assumption,
                             feature_probability=self.feature_probability,
                             default_feature_probability=self.default_feature_probability,
                             bool_update_feature_probability=self.bool_update_feature_probability,
@@ -2620,14 +2615,15 @@ class Program:
                 new.simplify(inplace=True)
             except ValueError:
                 #print('error in simplfy new prog')
-                new._override_is_valid = False
+                #new._override_is_valid = False
+                pass
             if inplace:
                 self.program = new
                 self.override_is_valid = new._override_is_valid
                 self._hash = None
                 self.already_bootstrapped = False
                 self.already_brgflow = False
-                return self
+                return self, succesfull
             return new, succesfull
-            
-    
+        
+   

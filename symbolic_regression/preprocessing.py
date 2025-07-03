@@ -3,6 +3,37 @@ import pandas as pd
 from pyHSICLasso import HSICLasso
 
 
+
+def check_assumptions(df):
+    assumptions = {
+        "real": lambda x: np.isreal(x),
+        "finite": lambda x: np.isfinite(x),
+        "positive": lambda x: x > 0,
+        "negative": lambda x: x < 0,
+        "nonpositive": lambda x: x <= 0,
+        "nonnegative": lambda x: x >= 0,
+    }
+
+    result = {}
+    for col in df.columns:
+        col_data = df[col]
+        col_result = {}
+        for name, func in assumptions.items():
+            try:
+                passed = func(col_data)
+                if isinstance(passed, pd.Series):
+                    # If all values in the column pass the test (ignoring NaNs)
+                    col_result[name] = bool(passed.dropna().all())
+                else:
+                    col_result[name] = bool(passed.all())
+            except Exception:
+                col_result[name] = False  # Handle errors gracefully
+                print('raised exception in feature assumption')
+        result[col] = col_result
+
+    return result
+
+
 def select_feature_probabilities_regression(data,features,target):
     
     from sklearn.ensemble import RandomForestRegressor

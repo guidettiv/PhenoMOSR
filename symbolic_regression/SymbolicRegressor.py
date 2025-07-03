@@ -14,6 +14,7 @@ from itertools import repeat
 from multiprocessing import Process, Queue
 from typing import Any, Dict, List, Tuple, Union
 from joblib import Parallel, delayed
+from symbolic_regression.preprocessing import check_assumptions
 
 import numpy as np
 import pandas as pd
@@ -99,6 +100,7 @@ class SymbolicRegressor:
         # Regressor Configuration
         self.client_name: str = client_name
         self.features: List = None
+        self.feature_assumption: dict = None
         self.feature_probability = None
         self.bool_update_feature_probability = None
         self.offspring_timeout_condition: tuple = offspring_timeout_condition
@@ -130,6 +132,7 @@ class SymbolicRegressor:
         self.genetic_algorithm: str = genetic_algorithm if genetic_algorithm in [
             'NSGA-II', 'SMS-EMOEA'] else 'NSGA-II'
         self.genetic_operators_frequency: dict = genetic_operators_frequency
+        self.genetic_operators_times: dict = {key:[] for key in  genetic_operators_frequency.keys() }
         self._stop_at_convergence: bool = False
         self._convergence_rolling_window: int = None
         self._convergence_rolling_window_threshold: float = 0.01
@@ -784,6 +787,8 @@ class SymbolicRegressor:
         self.bool_update_feature_probability = bool_update_feature_probability
         self.adjust_feature_probability = adjust_feature_probability
         self.operations = operations
+        self.feature_assumption = check_assumptions(data[self.features])
+        
     
         self.data_shape = data.shape
 
@@ -842,6 +847,57 @@ class SymbolicRegressor:
             - None
 
         """
+        from functools import wraps
+        import signal
+        def timeout_decorator_generation(seconds):
+            def decorator(func):
+                @wraps(func)
+                def wrapper(*args, **kwargs):
+                    def handler(signum, frame):
+                        raise TimeoutError(f"Function execution timed out after {seconds} seconds")
+                    
+                    # Set the timeout handler (only works on Unix-based systems)
+                    original_handler = signal.signal(signal.SIGALRM, handler)
+                    signal.alarm(seconds)
+                    
+                    try:
+                        result = func(*args, **kwargs)
+                        return result
+                    except Exception as e:
+                        # You can log the exception here if needed
+                        return None
+                    finally:
+                        # Cancel the timeout and restore the original handler
+                        signal.alarm(0)
+                        signal.signal(signal.SIGALRM, original_handler)
+                return wrapper
+            return decorator
+        
+        def timeout_decorator_offspring(seconds):
+            def decorator(func):
+                @wraps(func)
+                def wrapper(*args, **kwargs):
+                    def handler(signum, frame):
+                        raise TimeoutError(f"Function execution timed out after {seconds} seconds")
+                    
+                    # Set the timeout handler (only works on Unix-based systems)
+                    original_handler = signal.signal(signal.SIGALRM, handler)
+                    signal.alarm(seconds)
+                    
+                    try:
+                        result = func(*args, **kwargs)
+                        return result
+                    except Exception as e:
+                        # Return a tuple with the same structure but "empty" values
+                        return (None, 0, 0, None, 0)
+                    finally:
+                        # Cancel the timeout and restore the original handler
+                        signal.alarm(0)
+                        signal.signal(signal.SIGALRM, original_handler)
+                return wrapper
+            return decorator
+
+
         total_generation_time = 0
         jobs = self.n_jobs if self.n_jobs > 0 else os.cpu_count()
         fit_start = time.perf_counter()
@@ -861,22 +917,28 @@ class SymbolicRegressor:
                 print(f"Initializing population")
             self.status = "Generating population"
 
-        
+            # Apply the decorator to the generate_individual method
+            timeout_generate_individual = timeout_decorator_generation(50)(self.generate_individual)
+
             results = Parallel(n_jobs=jobs)(
-                        delayed(self.generate_individual)(
-                            data=data,
-                            features=self.features,
-                            feature_probability=self.feature_probability,
-                            bool_update_feature_probability = self.bool_update_feature_probability,
-                            operations=self.operations,
-                            fitness_functions=self.fitness_functions,
-                            const_range=self.const_range,
-                            parsimony=self.parsimony,
-                            parsimony_decay=self.parsimony_decay,
-                            val_data=val_data
-                        )
-                        for _ in range(self.population_size)
-                    )
+                delayed(timeout_generate_individual)(
+                    data=data,
+                    features=self.features,
+                    feature_assumption=self.feature_assumption,
+                    feature_probability=self.feature_probability,
+                    bool_update_feature_probability=self.bool_update_feature_probability,
+                    operations=self.operations,
+                    fitness_functions=self.fitness_functions,
+                    const_range=self.const_range, 
+                    parsimony=self.parsimony,
+                    parsimony_decay=self.parsimony_decay,
+                    val_data=val_data
+                )
+                for _ in range(self.population_size)
+            )
+
+            # Filter valid results (those that didn't time out)
+            results = [r for r in results if r is not None]
             
             self.population = Population(results)
 
@@ -906,10 +968,14 @@ class SymbolicRegressor:
                 logging.info(
                     f"Population of {len(self.population)} elements is less than population_size:{self.population_size}. Integrating with new elements")
                 new_individuals = self.population_size - len(self.population)
+                # Apply the decorator to the generate_individual method
+                timeout_generate_individual = timeout_decorator_generation(50)(self.generate_individual)
+
                 refill_training_start = Parallel(n_jobs=jobs)(
-                        delayed(self.generate_individual)(
+                        delayed(timeout_generate_individual)(
                             data=data,
                             features=self.features,
+                            feature_assumption=self.feature_assumption,
                             feature_probability=self.feature_probability,
                             bool_update_feature_probability = self.bool_update_feature_probability,
                             operations=self.operations,
@@ -1056,8 +1122,11 @@ class SymbolicRegressor:
                 # Run this batch in parallel via joblib
                 # Each delayed(...) call spawns a chunk of new offspring
                 # ------------------------------------------------------------
+                # Apply the decorator for timeout
+                timeout_generate_offspring = timeout_decorator_offspring(50)(self._generate_one_offspring)    
+
                 results = Parallel(n_jobs=jobs)(
-                    delayed(self._generate_one_offspring)(
+                    delayed(timeout_generate_offspring)(
                         data=data,
                         genetic_operators_frequency=self.genetic_operators_frequency,
                         fitness_functions=self.fitness_functions,
@@ -1068,19 +1137,24 @@ class SymbolicRegressor:
                     )
                     for _ in range(batch_tasks)
                 )
+
+                # Filter out timeout results before unpacking
+                results = [r for r in results if r[0] is not None]
+
                 # `results` is now a list of lists 
                 # unpack them into `offsprings`, nr_brgflow, nr_bootstrap
                 # zip(*list_of_lists) effectively "rotates" the rows into columns
-                children, nr_brgflow, nr_bootstrap = zip(*results)
+                try:
+                    children, nr_brgflow, nr_bootstrap, gen_ops, gen_ops_time = zip(*results)
+                except ValueError: 
+                    print(results)
 
                 # zip returns tuples, so to make children a list:
                 offsprings+=list(children)
                 self.nr_success_brgflow += sum(nr_brgflow)
                 self.nr_success_bootstrap += sum(nr_bootstrap)
-
-            
-
-                    
+                for geop, geop_time in zip(gen_ops, gen_ops_time):
+                    self.genetic_operators_times[geop].append(geop_time)
                 
 
                 # ------------------------------------------------------------
@@ -1220,10 +1294,13 @@ class SymbolicRegressor:
                     # Run this batch in parallel via joblib
                     # Each delayed(...) call spawns a chunk of new offspring
                     # ------------------------------------------------------------
+                    timeout_generate_individual = timeout_decorator_generation(50)(self.generate_individual)
+
                     results = Parallel(n_jobs=jobs)(
-                        delayed(self.generate_individual)(
+                        delayed(timeout_generate_individual)(
                             data=data,
                             features=self.features,
+                            feature_assumption=self.feature_assumption,
                             feature_probability=self.feature_probability,
                             bool_update_feature_probability = self.bool_update_feature_probability,
                             operations=self.operations,
@@ -1284,8 +1361,14 @@ class SymbolicRegressor:
                             traceback.format_exc())
 
                 # exludes every program in refill with an empty fitness
-                self.population = [
-                    p for p in self.population if not p._has_incomplete_fitness]
+                new_pop=[]
+                for p in self.population:
+                    try:
+                        if not p._has_incomplete_fitness:
+                            new_pop.append(p)
+                    except:
+                        pass
+                self.population=new_pop
 
                 self.times.loc[self.generation,
                                "time_refill_invalid"] = time.perf_counter() - start_refill_population
@@ -1296,9 +1379,21 @@ class SymbolicRegressor:
 
             #################################################################################
             #################################################################################
-            # Refill population stops
+            # Refill population stops / Start drop residual duplicates
             #################################################################################
             #################################################################################
+            before_cleaning = len(self.population)
+            self.drop_duplicates(inplace=True)
+            
+            after_drop_duplicates = len(self.population)
+            logging.debug(
+                f"{before_cleaning-after_drop_duplicates}/{before_cleaning} duplicates programs removed")
+            #################################################################################
+            #################################################################################
+            # End drop residual duplicates
+            #################################################################################
+            #################################################################################
+            
             start_pareto_front_computation = time.perf_counter()
 
             self.status = "Pareto Front Computation"
@@ -1427,10 +1522,16 @@ class SymbolicRegressor:
                 return
 
     def generate_individual(self,
-                            data: Union[dict, pd.DataFrame, pd.Series], features: List[str],
-                            feature_probability: List[float], bool_update_feature_probability: bool, operations: List[dict],
-                            fitness_functions: List[BaseFitness], const_range: tuple = (0, 1),
-                            parsimony: float = 0.8, parsimony_decay: float = 0.85,
+                            data: Union[dict, pd.DataFrame, pd.Series], 
+                            features: List[str],
+                            feature_assumption: dict,
+                            feature_probability: List[float], 
+                            bool_update_feature_probability: bool, 
+                            operations: List[dict],
+                            fitness_functions: List[BaseFitness], 
+                            const_range: tuple = (0, 1),
+                            parsimony: float = 0.8, 
+                            parsimony_decay: float = 0.85,
                             val_data: Union[dict, pd.DataFrame, pd.Series] = None) -> Program:
         """
         This method generates a new individual for the population
@@ -1467,6 +1568,7 @@ class SymbolicRegressor:
         """
 
         new_p = Program(features=features, 
+                        feature_assumption=feature_assumption,
                         feature_probability=feature_probability,
                         default_feature_probability=feature_probability,
                         bool_update_feature_probability=bool_update_feature_probability,
@@ -1543,7 +1645,249 @@ class SymbolicRegressor:
 
         return best_member
 
-    def _get_offspring(self, data: Union[dict, pd.DataFrame, pd.Series], genetic_operators_frequency: Dict[str, float], fitness_functions: List[BaseFitness], population: Population, tournament_size: int, generation: int, val_data: Union[Dict, pd.Series, pd.DataFrame] = None) -> Program:
+    def _get_offspring(self,
+                       data: Union[dict, pd.DataFrame, pd.Series], 
+                       genetic_operators_frequency: Dict[str, float], 
+                       fitness_functions: List[BaseFitness], 
+                       population: Population, 
+                       tournament_size: int, 
+                       generation: int, 
+                       val_data: Union[Dict, pd.Series, pd.DataFrame] = None) -> Program:
+        """
+        This method generates an offspring of a program from the current population
+
+        The offspring is a program to which a genetic alteration has been applied.
+        The possible operations are as follow:
+            - crossover: a random subtree from another program replaces
+                a random subtree of the current program
+            - mutation: a random subtree of the current program is replaced by a newly
+                generated subtree
+            - randomization: it is a crossover with a portion of the same program instead of a portion
+                of another program
+            - deletion: a random subtree is deleted from the current program
+            - insertion: a newly generated subtree is inserted in a random spot of the current program
+            - operator mutation: a random operation is replaced by another with the same arity
+            - leaf mutation: a terminal node (feature or constant) is replaced by a different one
+            - simplify: uses a sympy backend to simplify the program ad reduce its complexity
+            - do nothing: in this case no mutation is applied and the program is returned as is
+
+        The frequency of which those operation are applied is determined by the dictionary
+        genetic_operations_frequency in which the relative frequency of each of the desired operations
+        is expressed with integers. The higher the number the likelier the operation will be chosen.
+        Use integers > 1 to increase the frequency of an operation. Use 1 as minimum value.
+
+        The program to which apply the operation is chosen using the tournament_selection, a method
+        that identify the best program among a random selection of k programs from the population.
+
+        Args:
+            - data: Union[dict, pd.DataFrame, pd.Series]
+                The data on which the performance are evaluated. We could use compute_fitness
+                later, but we need to evaluate the fitness here to compute it in the
+                parallel initialization.
+            - genetic_operators_frequency: Dict[str, float]
+                The dictionary of the genetic operators and their frequency
+            - fitness_functions: List[BaseFitness]
+                The list of fitness functions to be used in the generation
+            - population: List[Program]
+                The current population from which to choose the program to which apply the genetic
+                operator
+            - tournament_size: int
+                The size of the tournament selection
+            - generation: int
+                The current generation
+            - val_data: Union[Dict, pd.Series, pd.DataFrame] (default None)
+                The data on which the validation is performed
+
+        Returns:
+            - _offspring: Program
+                The offspring of the current population
+
+            - program1: Program     (only in case of errors or if the program is not valid)
+                The program from which the offspring is generated
+        """
+        #initialize a timeoutdecorator compatible with joblib
+        from functools import wraps
+        import threading
+        import time
+        
+        # Timeout decorator that works with joblib
+        def timeout(max_seconds):
+            def decorator(func):
+                @wraps(func)
+                def wrapper(*args, **kwargs):
+                    result = [TimeoutError(f"Function timed out after {max_seconds} seconds")]
+                    
+                    def target():
+                        try:
+                            result[0] = func(*args, **kwargs)
+                        except Exception as e:
+                            result[0] = e
+                    
+                    thread = threading.Thread(target=target)
+                    thread.daemon = True
+                    thread.start()
+                    thread.join(max_seconds)
+                    
+                    if isinstance(result[0], Exception):
+                        raise result[0]
+                    return result[0]
+                return wrapper
+            return decorator
+
+        # Function to perform genetic operation with timeout
+        @timeout(50)
+        def perform_genetic_operation(gen_op, program1, program2=None):
+            if gen_op == 'crossover':
+                return program1.cross_over(other=program2, inplace=False)
+            elif gen_op == 'mutation':
+                return program1.mutate(inplace=False)
+            elif gen_op == 'delete_node':
+                return program1.delete_node(inplace=False)
+            elif gen_op == 'insert_node':
+                return program1.insert_node(inplace=False)
+            elif gen_op == 'mutate_operator':
+                return program1.mutate_operator(inplace=False)
+            elif gen_op == 'mutate_leaf':
+                return program1.mutate_leaf(inplace=False)
+            elif gen_op == 'recalibrate':
+                return program1.recalibrate(inplace=False)
+            elif gen_op == 'regularize_brgflow':
+                return program1.regularize_brgflow(data=data, inplace=False)
+            elif gen_op == 'regularize_bootstrap':
+                return program1.regularize_bootstrap(data=data, inplace=False)
+            elif gen_op == 'additive_expansion':
+                return program1.additive_expansion(inplace=False)
+            elif gen_op == 'regularize_sensitivity':
+                return program1.regularize_sensitivity(data=data,inplace=False)
+            else:
+                logging.warning(
+                    f'Supported genetic operations: crossover, delete_node, do_nothing, insert_node, mutate_leaf, mutate_operator, simplification, mutation and randomize'
+                )
+                print('asking for non-existing mutations!!!!')
+                return program1
+            
+
+        #initialize successfull brgflow an bootstrap counters
+        successfull_brgflow=0
+        successfull_bootstrap=0
+
+        ## select program via tournament selection
+        program1 = self._tournament_selection(
+            population=population, tournament_size=tournament_size, generation=generation)
+        
+        # Select the genetic operation to apply
+        # The frequency of each operation is determined by the dictionary
+        # genetic_operators_frequency. The higher the number the likelier the operation will be chosen.
+        ops = list()
+        for op, freq in genetic_operators_frequency.items():
+            if not ( 
+                ((op=='regularize_bootstrap') and (len(program1.get_constants())<=2 or program1.already_bootstrapped)) 
+                or 
+                ((op=='regularize_brgflow') and (len(program1.get_constants())<=2 or program1.already_brgflow)) 
+                or 
+                ((op=='regularize_sensitivity') and (len(program1.get_constants())<=2 or program1.already_bootstrapped))
+                ):
+                ops += [op] * freq  
+        gen_op = random.choice(ops)
+
+        start = time.perf_counter()
+
+        try:
+            if  not program1.is_valid:
+                # If the program is not valid, we return a random tree.
+                # The invalid program will be removed from the population later.
+                #print(f'Program 1 not valid. ')
+                new = Program(operations=program1.operations,
+                            features=program1.features,
+                            feature_assumption=self.feature_assumption,
+                            feature_probability=program1.default_feature_probability,
+                            default_feature_probability=program1.default_feature_probability,
+                            bool_update_feature_probability=program1.bool_update_feature_probability,
+                            const_range=program1.const_range,
+                            parsimony=program1.parsimony,
+                            parsimony_decay=program1.parsimony_decay)
+
+                new.init_program()
+                new.compute_fitness(
+                    fitness_functions=fitness_functions, data=data, validation=False, simplify=True)
+                if val_data is not None:
+                    new.compute_fitness(
+                        fitness_functions=fitness_functions, data=val_data, validation=True, simplify=False)
+                #print(f'New program {new.program}.\n')
+                end = time.perf_counter()
+                return new, successfull_brgflow, successfull_bootstrap, gen_op, end-start
+
+            _offspring: Program = None
+            simplify = True
+
+            if gen_op == 'crossover':
+                program2 = self._tournament_selection(
+                    population=population, tournament_size=tournament_size, generation=generation)
+                if not program2.is_valid:
+                    new = Program(operations=program2.operations,
+                                features=program2.features,
+                                feature_assumption=self.feature_assumption,
+                                feature_probability=program2.default_feature_probability,
+                                default_feature_probability=program2.default_feature_probability,
+                                bool_update_feature_probability=program2.bool_update_feature_probability,
+                                const_range=program2.const_range,
+                                parsimony=program2.parsimony,
+                                parsimony_decay=program2.parsimony_decay)
+
+                    new.init_program()
+                    new.compute_fitness(
+                        fitness_functions=fitness_functions, data=data, validation=False, simplify=True)
+                    if val_data is not None:
+                        new.compute_fitness(
+                            fitness_functions=fitness_functions, data=val_data, validation=True, simplify=False)
+                    end = time.perf_counter()
+                    return new, successfull_brgflow, successfull_bootstrap, gen_op, end-start
+                
+                _offspring = perform_genetic_operation(gen_op, program1, program2)
+            
+            elif gen_op in ['regularize_brgflow', 'regularize_bootstrap','regularize_sensitivity']:
+                result = perform_genetic_operation(gen_op, program1)
+                if gen_op == 'regularize_brgflow':
+                    _offspring, successfull_brgflow = result
+                else:  # regularize_bootstrap
+                    _offspring, successfull_bootstrap = result
+                simplify = False
+                
+            else:  # All other genetic operations
+                _offspring = perform_genetic_operation(gen_op, program1)
+            
+            #ensure the new program has a suitable feature assumption dictionary
+            _offspring.feature_assumption=self.feature_assumption
+            # Add the fitness to the object after the genetic operation
+            _offspring.compute_fitness(
+                fitness_functions=fitness_functions, data=data, simplify=simplify)
+            if val_data is not None:
+                _offspring.compute_fitness(
+                    fitness_functions=fitness_functions, data=val_data, validation=True, simplify=False)
+
+            ## COMPUTE FEATURE PROBABILITY
+            if _offspring.bool_update_feature_probability:
+                _offspring.feature_probability=_offspring.update_feature_probability(data=data)
+
+            # Reset the hash to force the re-computation
+            _offspring._hash = None
+            end = time.perf_counter()
+            return _offspring, successfull_brgflow, successfull_bootstrap, gen_op, end-start
+           
+        except TimeoutError:
+            end = time.perf_counter()
+            print('Timeout', gen_op, end-start)
+            print(program1.program)
+            return program1, successfull_brgflow, successfull_bootstrap, gen_op, end-start
+
+    def _get_offspring_old(self,
+                       data: Union[dict, pd.DataFrame, pd.Series], 
+                       genetic_operators_frequency: Dict[str, float], 
+                       fitness_functions: List[BaseFitness], 
+                       population: Population, 
+                       tournament_size: int, 
+                       generation: int, 
+                       val_data: Union[Dict, pd.Series, pd.DataFrame] = None) -> Program:
         """
         This method generates an offspring of a program from the current population
 
@@ -1603,51 +1947,41 @@ class SymbolicRegressor:
         successfull_brgflow=0
         successfull_bootstrap=0
 
-        ops = list()
-        for op, freq in genetic_operators_frequency.items():
-            ops += [op] * freq
-        gen_op = random.choice(ops)
-
-
         program1 = self._tournament_selection(
             population=population, tournament_size=tournament_size, generation=generation)
+        
+ 
+        ops = list()
+        for op, freq in genetic_operators_frequency.items():
+            if not ( ((op=='regularize_bootstrap') and (len(program1.get_constants())<=2 or program1.already_bootstrapped)) or ((op=='regularize_brgflow') and (len(program1.get_constants())<=2 or program1.already_brgflow))):
+                ops += [op] * freq  
+        gen_op = random.choice(ops)
 
-        #print(f'Program {program1.program} undergoes {gen_op}.\nProgram1 feat prob {program1.feature_probability}\nProgram1 default feat prob {program1.default_feature_probability}\n')
-        if  not program1.is_valid:
-            # If the program is not valid, we return a random tree.
-            # The invalid program will be removed from the population later.
-            #print(f'Program 1 not valid. ')
-            new = Program(operations=program1.operations,
-                        features=program1.features,
-                        feature_probability=program1.default_feature_probability,
-                        default_feature_probability=program1.default_feature_probability,
-                        bool_update_feature_probability=program1.bool_update_feature_probability,
-                        const_range=program1.const_range,
-                        parsimony=program1.parsimony,
-                        parsimony_decay=program1.parsimony_decay)
+        start = time.perf_counter()
 
-            new.init_program()
-            new.compute_fitness(
-                fitness_functions=fitness_functions, data=data, validation=False, simplify=True)
-            if val_data is not None:
-                new.compute_fitness(
-                    fitness_functions=fitness_functions, data=val_data, validation=True, simplify=False)
-            #print(f'New program {new.program}.\n')
-            return new, successfull_brgflow, successfull_bootstrap
 
-        _offspring: Program = None
-        if gen_op == 'crossover':
-            program2 = self._tournament_selection(
-                population=population, tournament_size=tournament_size, generation=generation)
-            if not program2.is_valid:
-                new = Program(operations=program2.operations,
-                            features=program2.features,
-                            feature_probability=program2.default_feature_probability,
-                            default_feature_probability=program2.default_feature_probability,
-                            bool_update_feature_probability=program2.bool_update_feature_probability,
-                            const_range=program2.const_range,
-                            parsimony=program2.parsimony,
-                            parsimony_decay=program2.parsimony_decay)
+        import signal
+        max_time=3
+        def timeout_offspring_handler(signum, frame):
+            raise TimeoutError(f"Offspring operation timed out after {max_time}s")
+        
+        # Set the timeout alarm
+        signal.signal(signal.SIGALRM, timeout_offspring_handler)
+        signal.alarm(3)  
+        try:
+            if  not program1.is_valid:
+                # If the program is not valid, we return a random tree.
+                # The invalid program will be removed from the population later.
+                #print(f'Program 1 not valid. ')
+                new = Program(operations=program1.operations,
+                            features=program1.features,
+                            feature_assumption=self.feature_assumption,
+                            feature_probability=program1.default_feature_probability,
+                            default_feature_probability=program1.default_feature_probability,
+                            bool_update_feature_probability=program1.bool_update_feature_probability,
+                            const_range=program1.const_range,
+                            parsimony=program1.parsimony,
+                            parsimony_decay=program1.parsimony_decay)
 
                 new.init_program()
                 new.compute_fitness(
@@ -1655,90 +1989,117 @@ class SymbolicRegressor:
                 if val_data is not None:
                     new.compute_fitness(
                         fitness_functions=fitness_functions, data=val_data, validation=True, simplify=False)
-                return new, successfull_brgflow, successfull_bootstrap
+                #print(f'New program {new.program}.\n')
+                end = time.perf_counter()
+                signal.alarm(0)
+                print(gen_op, end-start)
+                return new, successfull_brgflow, successfull_bootstrap, gen_op, end-start
+
+            _offspring: Program = None
+            if gen_op == 'crossover':
+                program2 = self._tournament_selection(
+                    population=population, tournament_size=tournament_size, generation=generation)
+                if not program2.is_valid:
+                    new = Program(operations=program2.operations,
+                                features=program2.features,
+                                feature_assumption=self.feature_assumption,
+                                feature_probability=program2.default_feature_probability,
+                                default_feature_probability=program2.default_feature_probability,
+                                bool_update_feature_probability=program2.bool_update_feature_probability,
+                                const_range=program2.const_range,
+                                parsimony=program2.parsimony,
+                                parsimony_decay=program2.parsimony_decay)
+
+                    new.init_program()
+                    new.compute_fitness(
+                        fitness_functions=fitness_functions, data=data, validation=False, simplify=True)
+                    if val_data is not None:
+                        new.compute_fitness(
+                            fitness_functions=fitness_functions, data=val_data, validation=True, simplify=False)
+                    end = time.perf_counter()
+                    signal.alarm(0)
+                    print(gen_op, end-start)
+                    return new, successfull_brgflow, successfull_bootstrap, gen_op, end-start
+                
+                _offspring = program1.cross_over(
+                    other=program2, inplace=False)
+                simplify=True
+
+            elif gen_op == 'mutation':
+                _offspring = program1.mutate(inplace=False)
+                simplify=True
+
+            elif gen_op == 'delete_node':
+                _offspring = program1.delete_node(inplace=False)
+                simplify=True
+
+            elif gen_op == 'insert_node':
+                _offspring = program1.insert_node(inplace=False)
+                simplify=True
+
+            elif gen_op == 'mutate_operator':
+                _offspring = program1.mutate_operator(inplace=False)
+                simplify=True
+
+            elif gen_op == 'mutate_leaf':
+                _offspring = program1.mutate_leaf(inplace=False)
+                simplify=True
+
+            elif gen_op == 'recalibrate':
+                _offspring = program1.recalibrate(inplace=False)
+                simplify=True
+
+            elif gen_op == 'regularize_brgflow':
+                _offspring, successfull_brgflow = program1.regularize_brgflow(data=data,
+                                                        inplace=False)
+                simplify=False
             
-            _offspring = program1.cross_over(
-                other=program2, inplace=False)
-            simplify=True
+            elif gen_op == 'regularize_bootstrap':
+                _offspring, successfull_bootstrap = program1.regularize_bootstrap(data=data,
+                                                        inplace=False)
+                simplify=False
+            
+            elif gen_op == 'additive_expansion':
+                _offspring = program1.additive_expansion(inplace=False)
+                simplify=True
 
-        elif gen_op == 'randomize':
-            # Will generate a new tree as other
-            _offspring = program1.cross_over(other=None, inplace=False)
-            simplify=True
+            else:
+                logging.warning(
+                    f'Supported genetic operations: crossover, delete_node, do_nothing, insert_node, mutate_leaf, mutate_operator, simplification, mutation and randomize'
+                )
 
-        elif gen_op == 'mutation':
-            _offspring = program1.mutate(inplace=False)
-            simplify=True
-
-        elif gen_op == 'delete_node':
-            _offspring = program1.delete_node(inplace=False)
-            simplify=True
-
-        elif gen_op == 'insert_node':
-            _offspring = program1.insert_node(inplace=False)
-            simplify=True
-
-        elif gen_op == 'mutate_operator':
-            _offspring = program1.mutate_operator(inplace=False)
-            simplify=True
-
-        elif gen_op == 'mutate_leaf':
-            _offspring = program1.mutate_leaf(inplace=False)
-            simplify=True
-
-        elif gen_op == 'simplification':
-            _offspring = program1.simplify(inplace=False)
-            simplify=True
-
-        elif gen_op == 'recalibrate':
-            _offspring = program1.recalibrate(inplace=False)
-            simplify=True
-
-        elif gen_op == 'regularize_brgflow':
-            _offspring, successfull_brgflow = program1.regularize_brgflow(data=data,
-                                                     inplace=False)
-            #if successfull_brgflow==1:
-            #    print('successfull brg')
-            simplify=False
-        
-        elif gen_op == 'regularize_bootstrap':
-            _offspring, successfull_bootstrap = program1.regularize_bootstrap(data=data,
-                                                       inplace=False)
-            #if successfull_bootstrap==1:
-            #    print('successfull boostrap')
-            simplify=False
-        
-        elif gen_op == 'additive_expansion':
-            _offspring = program1.additive_expansion(inplace=False)
-            simplify=True
-
-        else:
-            logging.warning(
-                f'Supported genetic operations: crossover, delete_node, do_nothing, insert_node, mutate_leaf, mutate_operator, simplification, mutation and randomize'
-            )
-
-            print('asking for non-existing mutations!!!!')
-            return program1
-
-        # Add the fitness to the object after the genetic operation
-        _offspring.compute_fitness(
-            fitness_functions=fitness_functions, data=data, simplify=simplify)
-        if val_data is not None:
+                print('asking for non-existing mutations!!!!')
+                return program1
+            
+            #ensure the new program has a suitable feature assumption dictionary
+            _offspring.feature_assumption=self.feature_assumption
+            # Add the fitness to the object after the genetic operation
             _offspring.compute_fitness(
-                fitness_functions=fitness_functions, data=val_data, validation=True, simplify=False)
+                fitness_functions=fitness_functions, data=data, simplify=simplify)
+            if val_data is not None:
+                _offspring.compute_fitness(
+                    fitness_functions=fitness_functions, data=val_data, validation=True, simplify=False)
 
-        ## COMPUTE FEATURE PROBABILITY
-        if _offspring.bool_update_feature_probability:
-            _offspring.feature_probability=_offspring.update_feature_probability(data=data)
+            ## COMPUTE FEATURE PROBABILITY
+            if _offspring.bool_update_feature_probability:
+                _offspring.feature_probability=_offspring.update_feature_probability(data=data)
 
-        #print(f'Result: {_offspring.program}\n')#Feature prob. {_offspring.feature_probability}')
+            #print(f'Result: {_offspring.program}\n')#Feature prob. {_offspring.feature_probability}')
 
-        # Reset the hash to force the re-computation
-        _offspring._hash = None
+            # Reset the hash to force the re-computation
+            _offspring._hash = None
+            end = time.perf_counter()
+            signal.alarm(0)
+            print(gen_op, end-start)
+            return _offspring, successfull_brgflow, successfull_bootstrap, gen_op, end-start
+           
+        except TimeoutError:
+            signal.alarm(0)
+            end = time.perf_counter()
+            print(gen_op, max_time, 'Timeout')
+            return program1, successfull_brgflow, successfull_bootstrap, gen_op, max_time
 
-        return _offspring, successfull_brgflow, successfull_bootstrap
 
-    
     def _generate_one_offspring(self,
                                 data: Union[dict, pd.DataFrame, pd.Series],
                                 genetic_operators_frequency: Dict[str, float],
@@ -1773,7 +2134,7 @@ class SymbolicRegressor:
 
         # Call your method that actually creates a single offspring
         
-        offspring, successfull_brgflow, successfull_bootstrap = self._get_offspring(
+        offspring, successfull_brgflow, successfull_bootstrap, gen_op, gen_op_time = self._get_offspring(
             data=data,
             val_data=val_data,
             genetic_operators_frequency=genetic_operators_frequency,
@@ -1785,7 +2146,7 @@ class SymbolicRegressor:
         # Skip "incomplete" offspring
         if offspring._has_incomplete_fitness:
             return None, 0, 0
-        return offspring, successfull_brgflow, successfull_bootstrap
+        return offspring, successfull_brgflow, successfull_bootstrap, gen_op, gen_op_time
  
 
     @property

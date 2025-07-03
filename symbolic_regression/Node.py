@@ -447,7 +447,7 @@ class FeatureNode(Node):
         self._feature: Union[str, float] = feature
         self.feature: Union[str, float] = feature
 
-        self.arity = 0  # because it is a constand and not an operator
+        self.arity = 0  # because it is a constant and not an operator
         self.is_constant = is_constant
         self.index = None
 

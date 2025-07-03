@@ -49,8 +49,8 @@ class WeightedMeanSquaredError(BaseFitness):
             wmse = (((pred - data[self.target])**2) * data[self.weights]
                     ).mean() if self.weights and not validation else ((pred - data[self.target])**2).mean()
 
-            if wmse<1e-7:
-                program.converged=True
+            #if wmse<1e-7:
+            #    program.converged=True
 
             if isinstance(self.max_error, float) and wmse > self.max_error:
                 return np.inf if not self.export else (np.inf, {'pred': pred})

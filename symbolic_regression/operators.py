@@ -119,7 +119,7 @@ OPERATOR_ABS = {
     "func": np.abs,
     "format_tf": 'tf.abs({})',
     "arity": 1,
-    "symbol": "abs",
+    "symbol": "Abs",
     "format_str": "Abs({})",
     "format_result": "Abs({})",
     "commutative": False
@@ -150,7 +150,7 @@ OPERATOR_LOG = {
     "format_tf": 'tf.math.log({})',
     "arity": 1,
     "symbol": "log",
-    "format_str": "log({})",
+    "format_str": "log(Abs({}))",
     "format_result": "log(Abs({}))",
     "commutative": False
 }
@@ -170,7 +170,7 @@ OPERATOR_POW = {
     "format_tf": 'tf.pow({}, {})',
     "arity": 2,
     "symbol": "^",
-    "format_str": "({} ** {})",
+    "format_str": "(Abs({}) ** {})",
     "format_result": "(Abs({}) ** {})",
     "commutative": False
 }
@@ -180,7 +180,7 @@ OPERATOR_SQRT = {
     "format_tf": 'tf.sqrt({})',
     "arity": 1,
     "symbol": "sqrt",
-    "format_str": "sqrt({})",
+    "format_str": "sqrt(Abs({}))",
     "format_result": "sqrt(Abs({}))",
     "commutative": False}
 
